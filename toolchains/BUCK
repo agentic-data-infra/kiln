@@ -13,7 +13,16 @@ system_cxx_toolchain(
     compiler_type = "gcc",
     cxx_compiler = "g++-12",
     linker = "g++-12",
-    cxx_flags = ["-std=c++20", "-fcoroutines"],
+    cxx_flags = [
+        "-std=c++20",
+        "-fcoroutines",
+        # Keep folly's layouts identical to its GCC 11 build: GCC 12's
+        # std::hardware_destructive_interference_size (64 on x86) would
+        # replace folly's own 128, and its constexpr std::vector would change
+        # folly's compression context pools.
+        "--param=destructive-interference-size=128",
+        "-DFOLLY_COMPRESSION_HAS_CONSTEXPR_VECTOR=0",
+    ],
     # The prelude asks for lld with any compiler but "g++"; use GNU ld.
     link_flags = ["-fuse-ld=bfd"],
     link_style = "static",
