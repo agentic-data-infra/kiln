@@ -1,8 +1,8 @@
 # kiln
 Storage for agents' data.
 
-Kiln is a tiered chunk store in C++, in the style of
-[Crail](https://github.com/apache/incubator-crail). Storage servers hold
+Kiln is a high-performance, tiered, distributed chunk store written in C++,
+designed to be used by AI agents. Storage servers hold
 blocks (1 MiB) inside large regions (1 GiB) of memory or local files; a
 metadata server knows the regions and which blocks make up each chunk; and
 clients read and write the blocks directly at the servers, at (region,
