@@ -186,30 +186,36 @@ TCP over loopback, it measured:
 
 ## Building
 
-Kiln builds with [Buck2](https://buck2.build). Its dependencies (folly with
-folly::coro, fbthrift and its `thrift1` compiler, glog, gflags) are the ones
-Velox's setup script (`velox/scripts/setup-ubuntu.sh`) installs under
-`/usr/local`, and the system gtest (`libgtest-dev`). They are wrapped as
-prebuilt libraries; Kiln does not depend on Velox itself.
+Kiln builds with [Buck2](https://buck2.build) and GCC 12. Its dependencies
+(folly with folly::coro, fbthrift and its `thrift1` compiler) are the ones
+Velox's setup script (`velox/scripts/setup-ubuntu.sh`) builds, built with GCC
+12 into `/opt/deps-gcc12` by `scripts/build_deps_gcc12.sh`; glog, gflags and
+gtest come from the system (`libgoogle-glog-dev`, `libgflags-dev`,
+`libgtest-dev`). They are wrapped as prebuilt libraries; Kiln does not depend
+on Velox itself.
 
 Prerequisites: GCC 12 (`g++-12`), cmake, ninja, and buck2 on `PATH`.
 
 ```
-# Generate third-party/generated/deps.bzl from the installed fbthrift.
+# Once: build the dependencies (an hour or two) into /opt/deps-gcc12.
+scripts/build_deps_gcc12.sh
+
+# Generate third-party/generated/deps.bzl from them (--prefix for another place).
 scripts/gen_third_party.py
 
 buck2 build //...
 buck2 test //...
 ```
 
-Re-run `scripts/gen_third_party.py` whenever folly or fbthrift are reinstalled.
+Re-run `scripts/gen_third_party.py` whenever the dependencies are rebuilt.
 
 Optional backends are build options in `.buckconfig`, off by default:
 `-c kiln.rdma=true` and `-c kiln.s3=true` (no code behind them yet).
 
-Kiln builds with GCC 12 although folly and fbthrift are built with GCC 11:
-GCC 11 miscompiles `co_await` inside coroutine templates with the installed
-folly, which rules out fbthrift's generated `co_*` clients.
+Kiln needs GCC 12: GCC 11 miscompiles `co_await` inside coroutine templates
+with this folly, which rules out fbthrift's generated `co_*` clients. folly
+must be built with the same compiler, as its class layouts differ between
+GCC 11 and 12.
 
 GCC 12 has a coroutine bug of its own: inside a coroutine, it destroys some
 temporaries in a `co_await` expression twice. It happens with a braced
