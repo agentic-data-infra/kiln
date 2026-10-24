@@ -78,10 +78,12 @@ class RemoteMetadata : public MetadataRpc {
         client_{makeClient<thrift::MetadataService>(endpoint)} {}
 
   folly::coro::Task<std::vector<RegionInfo>> co_registerServer(
-      std::vector<RegionInfo> regions) override {
+      std::vector<RegionInfo> regions,
+      uint64_t budget) override {
     const auto request = toThrift(regions);
     co_return fromThrift(co_await translated(
-        client_->co_registerServer(request), endpoint_));
+        client_->co_registerServer(request, static_cast<int64_t>(budget)),
+        endpoint_));
   }
 
   folly::coro::Task<std::vector<RegionInfo>> co_getRegions(

@@ -87,7 +87,10 @@ folly::coro::Task<ChunkInfo> Client::co_stat(ChunkId id) {
     std::lock_guard lock(mutex_);
     auto it = chunks_.find(id);
     if (it != chunks_.end()) {
-      co_return it->second;
+      if (std::chrono::steady_clock::now() < it->second.expires) {
+        co_return it->second.info;
+      }
+      chunks_.erase(it);
     }
   }
   auto chunk = co_await metadata_->co_lookup(id);
@@ -149,7 +152,9 @@ void Client::cacheChunk(const ChunkInfo& chunk) {
   if (chunks_.size() >= kMaxCachedChunks) {
     chunks_.clear();
   }
-  chunks_[chunk.id] = chunk;
+  chunks_[chunk.id] = CachedChunk{
+      .info = chunk,
+      .expires = std::chrono::steady_clock::now() + options_.chunkCacheTtl};
 }
 
 ChunkWriter::ChunkWriter(Client& client, Placement placement)

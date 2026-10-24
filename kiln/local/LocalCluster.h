@@ -20,6 +20,9 @@ struct LocalClusterOptions {
   uint32_t localFsServers{2};
   uint32_t regionsPerServer{1};
   uint64_t regionSize{64 << 20};
+  // Each storage server's budget; 0 for all of its regions.
+  uint64_t budget{0};
+  meta::MetadataOptions metadata;
   // Where local-FS regions go; empty for the storage server's default.
   std::string localFsDir;
 };
@@ -39,7 +42,7 @@ class LocalCluster {
   }
 
   // The metadata server's state, e.g. to check free blocks in tests.
-  const meta::Metadata& metadata() const {
+  meta::Metadata& metadata() const {
     return *metadata_;
   }
 

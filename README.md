@@ -20,7 +20,26 @@ are `folly::coro::Task` based.
 Today Kiln has the chunk store core: the metadata server, DRAM and local-FS
 storage servers (both ephemeral: their data is gone when they stop), and the
 client, which reaches regions over TCP or, on the same host, by mapping their
-files. Eviction, refs, durable tiers and the catalog come next.
+files. Tiers fill up to the storage servers' byte budgets and then evict
+their least recently used chunks. Refs, durable tiers and the catalog come
+next.
+
+## Eviction
+
+Each storage server registers its regions with a byte budget (`kiln_server
+--budget_mb`, default all of its regions). When an allocation would leave
+less than 10% of a tier's budget free, the metadata server evicts the tier's
+least recently committed or looked up chunks until 20% is free. An evicted
+chunk is gone: `co_stat` and `co_read` fail with `kNotFound`.
+
+The blocks of an evicted or removed chunk are reused only after a grace
+period (`kiln_meta --grace_period_s`, default 30 s). Clients cache a chunk's
+blocks for less than that (`ClientOptions::chunkCacheTtl`, default 10 s), so
+a reader that found the chunk just before it went still reads its bytes, and
+lookups after the TTL tell the metadata server which chunks are in use. An
+allocation that only blocks in their grace period could satisfy waits for
+them; one that even evicting everything cannot satisfy (the tier is full of
+chunks being written) fails with `kOutOfSpace`.
 
 ## Using it
 
@@ -39,7 +58,7 @@ auto data = co_await client.co_read(id, offset, length, std::move(buffer));
 A cluster on this machine, and the command line client:
 
 ```
-metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server
+metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server; -b budget_mb
 kiln() { $(buck2 build //bin:kiln --show-full-output | awk '{print $2}') --metadata=$metadata "$@"; }
 id=$(kiln put some/file)                # --tier=localfs for the local FS
 kiln stat $id

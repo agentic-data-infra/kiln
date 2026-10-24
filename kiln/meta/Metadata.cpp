@@ -3,14 +3,21 @@
 #include <algorithm>
 
 #include <fmt/format.h>
+#include <folly/coro/Sleep.h>
 
 #include "kiln/common/Error.h"
 
 namespace kiln::meta {
 
+Metadata::Metadata(MetadataOptions options) : options_{options} {}
+
 folly::coro::Task<std::vector<RegionInfo>> Metadata::co_registerServer(
-    std::vector<RegionInfo> regions) {
-  std::lock_guard lock(mutex_);
+    std::vector<RegionInfo> regions,
+    uint64_t budget) {
+  if (regions.empty()) {
+    throw Error(ErrorCode::kInvalidArgument, "No regions to register");
+  }
+  uint64_t blocks = 0;
   for (const auto& region : regions) {
     if (region.length < kBlockSize) {
       throw Error(
@@ -18,27 +25,50 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_registerServer(
           fmt::format(
               "Region of {} bytes is smaller than a block", region.length));
     }
+    if (region.server != regions[0].server || region.tier != regions[0].tier) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          "A server registers regions of one server and one tier");
+    }
+    blocks += region.length / kBlockSize;
+  }
+  if (budget != 0) {
+    if (budget < kBlockSize) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("Budget of {} bytes is less than a block", budget));
+    }
+    blocks = std::min(blocks, budget / kBlockSize);
   }
 
+  std::lock_guard lock(mutex_);
   // Forget the server's old regions and the chunks in them.
-  for (const auto& region : regions) {
-    std::erase_if(regions_, [&](const auto& entry) {
-      return entry.second.info.server == region.server;
-    });
-  }
-  std::erase_if(chunks_, [&](const auto& entry) {
-    return std::any_of(
-        entry.second.blocks.begin(),
-        entry.second.blocks.end(),
-        [&](const BlockRef& block) { return !regions_.contains(block.region); });
+  const auto& name = regions[0].server;
+  std::erase_if(regions_, [&](const auto& entry) {
+    return entry.second.info.server == name;
   });
+  servers_.erase(name);
+  for (auto it = chunks_.begin(); it != chunks_.end();) {
+    const auto& chunkBlocks = it->second.info.blocks;
+    const bool lost = std::any_of(
+        chunkBlocks.begin(), chunkBlocks.end(), [&](const BlockRef& block) {
+          return !regions_.contains(block.region);
+        });
+    auto next = std::next(it);
+    if (lost) {
+      eraseChunkLocked(it, /*grace=*/true);
+    }
+    it = next;
+  }
 
+  servers_.emplace(
+      name, Server{.tier = regions[0].tier, .budgetBlocks = blocks});
   for (auto& region : regions) {
     region.id = nextRegionId_++;
     Region state{.info = region};
-    const auto blocks = region.length / kBlockSize;
-    state.free.reserve(blocks);
-    for (uint64_t i = blocks; i-- > 0;) {
+    const auto regionBlocks = region.length / kBlockSize;
+    state.free.reserve(regionBlocks);
+    for (uint64_t i = regionBlocks; i-- > 0;) {
       state.free.push_back(i * kBlockSize);
     }
     regions_.emplace(region.id, std::move(state));
@@ -64,40 +94,113 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_getRegions(
 folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
     Placement placement,
     uint32_t count) {
-  std::lock_guard lock(mutex_);
-  std::vector<Region*> candidates;
-  size_t available = 0;
-  // Start the round after where the last one ended.
+  // Blocks freed before this call are reusable by the end of their grace
+  // period; waiting longer would not help.
+  const auto deadline =
+      Clock::now() + options_.gracePeriod + std::chrono::seconds(1);
+  for (;;) {
+    Clock::duration wait;
+    {
+      std::lock_guard lock(mutex_);
+      if (auto blocks = tryAllocateLocked(placement, count, wait)) {
+        co_return std::move(*blocks);
+      }
+    }
+    if (Clock::now() >= deadline) {
+      throw Error(
+          ErrorCode::kOutOfSpace,
+          fmt::format(
+              "No {} blocks in {} became free in time",
+              count,
+              toString(placement.tier)));
+    }
+    co_await folly::coro::sleep(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::clamp<Clock::duration>(
+                wait, std::chrono::milliseconds(1), options_.gracePeriod)));
+  }
+}
+
+std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
+    Placement placement,
+    uint32_t count,
+    Clock::duration& wait) {
+  const auto now = Clock::now();
+  reclaimLocked(now);
+
+  auto tierBlocks = [&](auto blocksOf) {
+    uint64_t sum = 0;
+    for (const auto& [name, server] : servers_) {
+      if (server.tier == placement.tier) {
+        sum += blocksOf(server);
+      }
+    }
+    return sum;
+  };
+  const auto budget = tierBlocks([](const Server& s) { return s.budgetBlocks; });
+  auto available = [&] {
+    // Free now or after the grace period.
+    return budget - tierBlocks([](const Server& s) { return s.liveBlocks; });
+  };
+
+  // Keep some of the tier free, so that allocations rarely wait for the
+  // grace period of the blocks they need.
+  if (available() < count + options_.evictBelow * budget) {
+    evictLocked(
+        placement.tier,
+        std::min<uint64_t>(budget, count + options_.evictUntil * budget));
+  }
+  if (available() < count) {
+    throw Error(
+        ErrorCode::kOutOfSpace,
+        fmt::format(
+            "Asked for {} blocks in {}: {} of {} are in chunks being written",
+            count,
+            toString(placement.tier),
+            budget - available(),
+            budget));
+  }
+  const auto freeNow = tierBlocks([](const Server& s) {
+    return s.budgetBlocks - s.liveBlocks - s.graceBlocks;
+  });
+  if (freeNow < count) {
+    // Wait until the oldest freed block of the tier is reusable.
+    wait = options_.gracePeriod;
+    for (const auto& entry : grace_) {
+      auto* server = serverOf(entry.block.region);
+      if (server != nullptr && server->tier == placement.tier) {
+        wait = entry.reusableAt - now;
+        break;
+      }
+    }
+    return std::nullopt;
+  }
+
+  // Round robin over the tier's regions, starting after where the last
+  // allocation ended.
+  std::vector<std::pair<Region*, Server*>> candidates;
+  auto consider = [&](Region& region) {
+    auto* server = serverOf(region.info.id);
+    if (region.info.tier == placement.tier && server != nullptr) {
+      candidates.emplace_back(&region, server);
+    }
+  };
   for (auto it = regions_.upper_bound(nextAllocation_); it != regions_.end();
        ++it) {
-    candidates.push_back(&it->second);
+    consider(it->second);
   }
   for (auto it = regions_.begin();
        it != regions_.end() && it->first <= nextAllocation_;
        ++it) {
-    candidates.push_back(&it->second);
-  }
-  std::erase_if(candidates, [&](Region* region) {
-    return region->info.tier != placement.tier || region->free.empty();
-  });
-  for (auto* region : candidates) {
-    available += region->free.size();
-  }
-  if (available < count) {
-    throw Error(
-        ErrorCode::kOutOfSpace,
-        fmt::format(
-            "Asked for {} blocks in {}, {} free",
-            count,
-            toString(placement.tier),
-            available));
+    consider(it->second);
   }
 
   std::vector<BlockRef> blocks;
   blocks.reserve(count);
   for (size_t i = 0; blocks.size() < count; ++i) {
-    auto* region = candidates[i % candidates.size()];
-    if (region->free.empty()) {
+    auto [region, server] = candidates[i % candidates.size()];
+    if (region->free.empty() ||
+        server->liveBlocks + server->graceBlocks >= server->budgetBlocks) {
       continue;
     }
     blocks.push_back(BlockRef{
@@ -105,25 +208,87 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
         .offset = region->free.back(),
         .length = kBlockSize});
     region->free.pop_back();
+    ++server->liveBlocks;
     nextAllocation_ = region->info.id;
   }
-  co_return blocks;
+  return blocks;
+}
+
+void Metadata::evictLocked(Tier tier, uint64_t available) {
+  auto& lru = lruOf(tier);
+  auto live = [&] {
+    uint64_t sum = 0;
+    for (const auto& [name, server] : servers_) {
+      if (server.tier == tier) {
+        sum += server.liveBlocks;
+      }
+    }
+    return sum;
+  };
+  uint64_t budget = 0;
+  for (const auto& [name, server] : servers_) {
+    if (server.tier == tier) {
+      budget += server.budgetBlocks;
+    }
+  }
+  while (!lru.empty() && budget - live() < available) {
+    eraseChunkLocked(chunks_.find(lru.front()), /*grace=*/true);
+    ++evictions_;
+  }
+}
+
+void Metadata::reclaimLocked(Clock::time_point now) {
+  while (!grace_.empty() && grace_.front().reusableAt <= now) {
+    const auto& block = grace_.front().block;
+    // Blocks of regions that are gone stay gone.
+    auto region = regions_.find(block.region);
+    auto* server = serverOf(block.region);
+    if (region != regions_.end() && server != nullptr) {
+      region->second.free.push_back(block.offset);
+      --server->graceBlocks;
+    }
+    grace_.pop_front();
+  }
+}
+
+Metadata::Server* Metadata::serverOf(RegionId region) {
+  auto it = regions_.find(region);
+  if (it == regions_.end()) {
+    return nullptr;
+  }
+  auto server = servers_.find(it->second.info.server);
+  return server == servers_.end() ? nullptr : &server->second;
 }
 
 folly::coro::Task<void> Metadata::co_free(std::vector<BlockRef> blocks) {
   std::lock_guard lock(mutex_);
-  freeLocked(blocks);
+  freeLocked(blocks, /*grace=*/false);
   co_return;
 }
 
-void Metadata::freeLocked(const std::vector<BlockRef>& blocks) {
+void Metadata::freeLocked(const std::vector<BlockRef>& blocks, bool grace) {
+  const auto reusableAt = Clock::now() + options_.gracePeriod;
   for (const auto& block : blocks) {
-    // Blocks of regions that are gone stay gone.
-    auto it = regions_.find(block.region);
-    if (it != regions_.end()) {
-      it->second.free.push_back(block.offset);
+    auto* server = serverOf(block.region);
+    if (server == nullptr) {
+      continue;
+    }
+    --server->liveBlocks;
+    if (grace) {
+      ++server->graceBlocks;
+      grace_.push_back(GraceBlock{.block = block, .reusableAt = reusableAt});
+    } else {
+      regions_.at(block.region).free.push_back(block.offset);
     }
   }
+}
+
+void Metadata::eraseChunkLocked(
+    std::unordered_map<ChunkId, Chunk>::iterator chunk,
+    bool grace) {
+  lruOf(chunk->second.info.placement.tier).erase(chunk->second.lru);
+  freeLocked(chunk->second.info.blocks, grace);
+  chunks_.erase(chunk);
 }
 
 folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
@@ -133,7 +298,8 @@ folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
     auto it = regions_.find(block.region);
     if (it == regions_.end() || block.offset % kBlockSize != 0 ||
         block.length > kBlockSize ||
-        block.offset + kBlockSize > it->second.info.length) {
+        block.offset + kBlockSize > it->second.info.length ||
+        it->second.info.tier != chunk.placement.tier) {
       throw Error(
           ErrorCode::kInvalidArgument,
           fmt::format(
@@ -151,12 +317,20 @@ folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
             "Chunk of {} bytes has {} bytes of blocks", chunk.size, size));
   }
 
-  auto [it, inserted] = chunks_.try_emplace(chunk.id, chunk);
-  if (!inserted) {
-    // The first commit wins; the same bytes are stored already.
-    freeLocked(chunk.blocks);
+  auto it = chunks_.find(chunk.id);
+  if (it != chunks_.end()) {
+    // The first commit wins; the same bytes are stored already. Nobody has
+    // seen this copy's blocks.
+    freeLocked(chunk.blocks, /*grace=*/false);
+    co_return it->second.info;
   }
-  co_return it->second;
+  auto& lru = lruOf(chunk.placement.tier);
+  lru.push_back(chunk.id);
+  const auto id = chunk.id;
+  it = chunks_
+           .emplace(id, Chunk{.info = std::move(chunk), .lru = std::prev(lru.end())})
+           .first;
+  co_return it->second.info;
 }
 
 folly::coro::Task<ChunkInfo> Metadata::co_lookup(ChunkId id) {
@@ -166,7 +340,9 @@ folly::coro::Task<ChunkInfo> Metadata::co_lookup(ChunkId id) {
     throw Error(
         ErrorCode::kNotFound, fmt::format("No chunk {}", id.toString()));
   }
-  co_return it->second;
+  auto& lru = lruOf(it->second.info.placement.tier);
+  lru.splice(lru.end(), lru, it->second.lru);
+  co_return it->second.info;
 }
 
 folly::coro::Task<bool> Metadata::co_remove(ChunkId id) {
@@ -175,17 +351,35 @@ folly::coro::Task<bool> Metadata::co_remove(ChunkId id) {
   if (it == chunks_.end()) {
     co_return false;
   }
-  freeLocked(it->second.blocks);
-  chunks_.erase(it);
+  eraseChunkLocked(it, /*grace=*/true);
   co_return true;
 }
 
 size_t Metadata::freeBlocks(Tier tier) const {
   std::lock_guard lock(mutex_);
   size_t count = 0;
-  for (const auto& [id, region] : regions_) {
-    if (region.info.tier == tier) {
-      count += region.free.size();
+  for (const auto& [name, server] : servers_) {
+    if (server.tier == tier) {
+      count += server.budgetBlocks - server.liveBlocks;
+    }
+  }
+  return count - graceBlocksLocked(tier);
+}
+
+size_t Metadata::graceBlocks(Tier tier) const {
+  std::lock_guard lock(mutex_);
+  return graceBlocksLocked(tier);
+}
+
+size_t Metadata::graceBlocksLocked(Tier tier) const {
+  const auto now = Clock::now();
+  size_t count = 0;
+  for (const auto& entry : grace_) {
+    auto region = regions_.find(entry.block.region);
+    if (entry.reusableAt > now && region != regions_.end() &&
+        region->second.info.tier == tier &&
+        servers_.contains(region->second.info.server)) {
+      ++count;
     }
   }
   return count;
@@ -194,6 +388,11 @@ size_t Metadata::freeBlocks(Tier tier) const {
 size_t Metadata::chunkCount() const {
   std::lock_guard lock(mutex_);
   return chunks_.size();
+}
+
+size_t Metadata::evictions() const {
+  std::lock_guard lock(mutex_);
+  return evictions_;
 }
 
 } // namespace kiln::meta

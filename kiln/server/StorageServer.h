@@ -31,6 +31,8 @@ struct StorageServerOptions {
   uint32_t regions{1};
   // A multiple of kBlockSize.
   uint64_t regionSize{kRegionSize};
+  // Bytes of the regions the metadata server may hand out; 0 for all.
+  uint64_t budget{0};
   // Where this server's directory of region files goes; empty for /dev/shm
   // (DRAM) or $TMPDIR, else /tmp (local FS).
   std::string dir;

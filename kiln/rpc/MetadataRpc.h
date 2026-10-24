@@ -16,16 +16,19 @@ class MetadataRpc {
  public:
   virtual ~MetadataRpc() = default;
 
-  // A storage server offers its regions (ids unset); returns them with the
-  // ids the metadata server gave them.
+  // A storage server offers its regions (ids unset), of which it lets
+  // 'budget' bytes be used (0 for all); returns them with the ids the
+  // metadata server gave them.
   virtual folly::coro::Task<std::vector<RegionInfo>> co_registerServer(
-      std::vector<RegionInfo> regions) = 0;
+      std::vector<RegionInfo> regions,
+      uint64_t budget) = 0;
 
   virtual folly::coro::Task<std::vector<RegionInfo>> co_getRegions(
       std::vector<RegionId> ids) = 0;
 
-  // 'count' free blocks of length kBlockSize in the placement's tier. Fails
-  // with kOutOfSpace if there are fewer.
+  // 'count' free blocks of length kBlockSize in the placement's tier. Evicts
+  // the tier's least recently used chunks to make room; fails with
+  // kOutOfSpace if that cannot make enough.
   virtual folly::coro::Task<std::vector<BlockRef>> co_allocate(
       Placement placement,
       uint32_t count) = 0;
@@ -37,10 +40,11 @@ class MetadataRpc {
   // the first one's chunk back, and its own blocks are freed.
   virtual folly::coro::Task<ChunkInfo> co_commit(ChunkInfo chunk) = 0;
 
-  // Fails with kNotFound if there is no such chunk.
+  // Fails with kNotFound if there is no such chunk, e.g. it was evicted.
   virtual folly::coro::Task<ChunkInfo> co_lookup(ChunkId id) = 0;
 
-  // Returns whether the chunk existed. Its blocks are freed.
+  // Returns whether the chunk existed. Its blocks are freed after the grace
+  // period, so readers that looked it up just before can still finish.
   virtual folly::coro::Task<bool> co_remove(ChunkId id) = 0;
 };
 

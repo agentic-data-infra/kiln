@@ -90,14 +90,17 @@ service MetadataService {
   /// Returns 'message'.
   string ping(1: string message);
 
-  /// A storage server offers its regions; returns them with their ids.
-  list<RegionInfo> registerServer(1: list<RegionInfo> regions) throws (
-    1: KilnException e,
-  );
+  /// A storage server offers its regions, of which it lets 'budget' bytes
+  /// be used (0 for all); returns them with their ids.
+  list<RegionInfo> registerServer(
+    1: list<RegionInfo> regions,
+    2: i64 budget,
+  ) throws (1: KilnException e);
 
   list<RegionInfo> getRegions(1: list<i64> ids) throws (1: KilnException e);
 
-  /// 'count' free blocks of length kBlockSize in the placement's tier.
+  /// 'count' free blocks of length kBlockSize in the placement's tier,
+  /// evicting the least recently used chunks there if needed.
   list<BlockRef> allocate(1: Placement placement, 2: i32 count) throws (
     1: KilnException e,
   );
@@ -111,7 +114,8 @@ service MetadataService {
 
   ChunkInfo lookup(1: ChunkId id) throws (1: KilnException e);
 
-  /// Returns whether the chunk existed. Its blocks are freed.
+  /// Returns whether the chunk existed. Its blocks are freed after the grace
+  /// period.
   bool remove(1: ChunkId id) throws (1: KilnException e);
 }
 

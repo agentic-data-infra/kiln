@@ -142,12 +142,16 @@ folly::coro::Task<std::unique_ptr<StorageServer>> StorageServer::co_start(
 
   co_await co_waitForMetadata(options.metadata, options.connectTimeout);
   auto metadata = rpc::connectMetadata(options.metadata);
-  server->regions_ = co_await metadata->co_registerServer(std::move(infos));
+  server->regions_ =
+      co_await metadata->co_registerServer(std::move(infos), options.budget);
   server->store_->registered(server->regions_);
   LOG(INFO) << "Storage server " << server->endpoint_.toString() << " serves "
             << options.regions << " " << toString(options.tier)
             << " regions of " << options.regionSize << " bytes in "
-            << server->dir_;
+            << server->dir_
+            << (options.budget == 0
+                    ? std::string()
+                    : fmt::format(", {} bytes of them in use at most", options.budget));
   co_return server;
 }
 
