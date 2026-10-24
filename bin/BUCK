@@ -1,0 +1,38 @@
+# Kiln's processes and its command line client.
+
+cxx_library(
+    name = "signals",
+    exported_headers = ["Signals.h"],
+    header_namespace = "bin",
+)
+
+cxx_binary(
+    name = "kiln_meta",
+    srcs = ["KilnMeta.cpp"],
+    deps = [
+        ":signals",
+        "//kiln/meta:meta",
+    ],
+    # Archives must precede the prebuilt libraries they use.
+    link_ordering = "topological",
+    visibility = ["PUBLIC"],
+)
+
+cxx_binary(
+    name = "kiln_server",
+    srcs = ["KilnServer.cpp"],
+    deps = [
+        ":signals",
+        "//kiln/server:server",
+    ],
+    link_ordering = "topological",
+    visibility = ["PUBLIC"],
+)
+
+cxx_binary(
+    name = "kiln",
+    srcs = ["Kiln.cpp"],
+    deps = ["//kiln/client:client"],
+    link_ordering = "topological",
+    visibility = ["PUBLIC"],
+)

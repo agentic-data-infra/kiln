@@ -1,19 +1,30 @@
-# Kiln's RPC over fbthrift. Code outside this package sees Kiln's own
-# interfaces (MetadataRpc.h), not the code generated from kiln.thrift.
+# Kiln's RPC over fbthrift. Only this package sees fbthrift and the code
+# generated from kiln.thrift: its headers expose Kiln's own interfaces
+# (MetadataRpc.h, StorageRpc.h) and how to serve and call them (Rpc.h).
 
 load("//third-party:thrift.bzl", "thrift_cpp_library")
 
 thrift_cpp_library(
     name = "kiln_thrift",
     src = "kiln.thrift",
-    services = ["MetadataService"],
-    visibility = ["//kiln/..."],
+    services = [
+        "MetadataService",
+        "StorageService",
+    ],
+    visibility = ["//kiln/rpc/..."],
 )
 
 cxx_library(
     name = "rpc",
+    srcs = glob(["*.cpp"]),
     header_namespace = "kiln/rpc",
-    exported_headers = ["MetadataRpc.h"],
+    exported_headers = [
+        "MetadataRpc.h",
+        "Rpc.h",
+        "StorageRpc.h",
+    ],
+    headers = ["Convert.h"],
     exported_deps = ["//kiln/common:common"],
+    deps = [":kiln_thrift"],
     visibility = ["PUBLIC"],
 )

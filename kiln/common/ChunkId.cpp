@@ -3,6 +3,8 @@
 #include <fmt/format.h>
 #include <folly/io/IOBuf.h>
 
+#include "kiln/common/Error.h"
+
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
@@ -21,12 +23,56 @@ ChunkId ChunkId::of(folly::ByteRange data) {
 }
 
 ChunkId ChunkId::of(const folly::IOBuf& data) {
-  XXH3_state_t state;
-  XXH3_128bits_reset(&state);
+  ChunkHasher hasher;
   for (auto range : data) {
-    XXH3_128bits_update(&state, range.data(), range.size());
+    hasher.update(range);
   }
-  return toChunkId(XXH3_128bits_digest(&state));
+  return hasher.id();
+}
+
+ChunkId ChunkId::parse(const std::string& id) {
+  auto word = [&](size_t start) {
+    uint64_t value = 0;
+    for (size_t i = start; i < start + 16; ++i) {
+      const char c = id[i];
+      int digit;
+      if (c >= '0' && c <= '9') {
+        digit = c - '0';
+      } else if (c >= 'a' && c <= 'f') {
+        digit = c - 'a' + 10;
+      } else {
+        throw Error(
+            ErrorCode::kInvalidArgument,
+            fmt::format("Bad chunk id '{}'", id));
+      }
+      value = (value << 4) | digit;
+    }
+    return value;
+  };
+  if (id.size() != 32) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format("Bad chunk id '{}': expected 32 hex digits", id));
+  }
+  return ChunkId{.high = word(0), .low = word(16)};
+}
+
+struct ChunkHasher::State {
+  XXH3_state_t xxh;
+};
+
+ChunkHasher::ChunkHasher() : state_{std::make_unique<State>()} {
+  XXH3_128bits_reset(&state_->xxh);
+}
+
+ChunkHasher::~ChunkHasher() = default;
+
+void ChunkHasher::update(folly::ByteRange data) {
+  XXH3_128bits_update(&state_->xxh, data.data(), data.size());
+}
+
+ChunkId ChunkHasher::id() const {
+  return toChunkId(XXH3_128bits_digest(&state_->xxh));
 }
 
 std::string ChunkId::toString() const {

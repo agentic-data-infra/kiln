@@ -16,6 +16,8 @@ system_cxx_toolchain(
     cxx_flags = [
         "-std=c++20",
         "-fcoroutines",
+        # The prelude adds no optimization flags of its own.
+        "-O2",
         # Keep folly's layouts identical to its GCC 11 build: GCC 12's
         # std::hardware_destructive_interference_size (64 on x86) would
         # replace folly's own 128, and its constexpr std::vector would change

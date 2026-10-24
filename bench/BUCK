@@ -1,0 +1,10 @@
+cxx_binary(
+    name = "transport_benchmark",
+    srcs = ["TransportBenchmark.cpp"],
+    deps = [
+        "//kiln/client:client",
+        "//kiln/local:local",
+    ],
+    # Archives must precede the prebuilt libraries they use.
+    link_ordering = "topological",
+)

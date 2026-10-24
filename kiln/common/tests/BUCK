@@ -1,6 +1,6 @@
 cxx_test(
-    name = "chunk_id_test",
-    srcs = ["ChunkIdTest.cpp"],
+    name = "common_test",
+    srcs = glob(["*.cpp"]),
     deps = [
         "//kiln/common:common",
         "//kiln/tests:test_main",

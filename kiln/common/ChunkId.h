@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include <folly/Range.h>
@@ -27,8 +28,30 @@ struct ChunkId {
   // 32 lowercase hex digits, high word first.
   std::string toString() const;
 
+  // Parses toString()'s form. Throws Error(kInvalidArgument) otherwise.
+  static ChunkId parse(const std::string& id);
+
   bool operator==(const ChunkId&) const = default;
   auto operator<=>(const ChunkId&) const = default;
+};
+
+// Computes a ChunkId over bytes that arrive in pieces.
+class ChunkHasher {
+ public:
+  ChunkHasher();
+  ~ChunkHasher();
+
+  ChunkHasher(const ChunkHasher&) = delete;
+  ChunkHasher& operator=(const ChunkHasher&) = delete;
+
+  void update(folly::ByteRange data);
+
+  // The id of all bytes so far.
+  ChunkId id() const;
+
+ private:
+  struct State;
+  std::unique_ptr<State> state_;
 };
 
 } // namespace kiln
