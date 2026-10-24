@@ -1,0 +1,41 @@
+# Kiln's external dependencies, installed outside the repo and wrapped as
+# prebuilt libraries. Flags come from third-party/generated/deps.bzl, which
+# scripts/gen_third_party.py derives from CMake.
+
+load(
+    "//third-party/generated:deps.bzl",
+    "GTEST_LINKER_FLAGS",
+    "GTEST_PREPROCESSOR_FLAGS",
+    "LINKER_FLAGS",
+    "PREPROCESSOR_FLAGS",
+)
+
+# folly (with folly::coro), glog and gflags, and fbthrift's C++ runtime. The
+# installed fbthrift is the one Velox's setup scripts build, with the same
+# folly. Code generation: thrift_cpp_library in thrift.bzl.
+prebuilt_cxx_library(
+    name = "fbthrift",
+    header_only = True,
+    exported_preprocessor_flags = PREPROCESSOR_FLAGS,
+    exported_post_linker_flags = LINKER_FLAGS,
+    visibility = ["PUBLIC"],
+)
+
+# The system googletest.
+prebuilt_cxx_library(
+    name = "gtest",
+    header_only = True,
+    exported_preprocessor_flags = GTEST_PREPROCESSOR_FLAGS,
+    exported_post_linker_flags = GTEST_LINKER_FLAGS,
+    visibility = ["PUBLIC"],
+)
+
+# xxHash 0.8.3 (BSD-2, see xxhash/LICENSE), header only: include it with
+# XXH_INLINE_ALL defined.
+prebuilt_cxx_library(
+    name = "xxhash",
+    header_only = True,
+    header_namespace = "",
+    exported_headers = {"xxhash.h": "xxhash/xxhash.h"},
+    visibility = ["PUBLIC"],
+)

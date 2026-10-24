@@ -1,0 +1,10 @@
+cxx_library(
+    name = "test_main",
+    srcs = ["Main.cpp"],
+    exported_deps = [
+        "//third-party:fbthrift",
+        "//third-party:gtest",
+    ],
+    link_whole = True,
+    visibility = ["PUBLIC"],
+)
