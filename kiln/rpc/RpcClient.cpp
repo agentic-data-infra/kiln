@@ -124,6 +124,42 @@ class RemoteMetadata : public MetadataRpc {
     co_return co_await translated(client_->co_remove(request), endpoint_);
   }
 
+  folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override {
+    co_return fromThrift(
+        co_await translated(client_->co_getRef(name), endpoint_));
+  }
+
+  folly::coro::Task<std::optional<Ref>> co_casRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion,
+      std::string value) override {
+    thrift::CasRefRequest request;
+    request.name() = std::move(name);
+    if (expectedVersion) {
+      request.expectedVersion() = static_cast<int64_t>(*expectedVersion);
+    }
+    request.value() = std::move(value);
+    co_return fromThrift(
+        co_await translated(client_->co_casRef(request), endpoint_));
+  }
+
+  folly::coro::Task<std::vector<Ref>> co_listRefs(
+      std::string prefix) override {
+    co_return fromThrift(
+        co_await translated(client_->co_listRefs(prefix), endpoint_));
+  }
+
+  folly::coro::Task<bool> co_removeRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion) override {
+    thrift::RemoveRefRequest request;
+    request.name() = std::move(name);
+    if (expectedVersion) {
+      request.expectedVersion() = static_cast<int64_t>(*expectedVersion);
+    }
+    co_return co_await translated(client_->co_removeRef(request), endpoint_);
+  }
+
   folly::coro::Task<void> co_ping() {
     const std::string message = "ping";
     co_await translated(client_->co_ping(message), endpoint_);

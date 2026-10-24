@@ -4,12 +4,14 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "kiln/meta/Journal.h"
 #include "kiln/rpc/MetadataRpc.h"
 
 namespace kiln::meta {
@@ -26,6 +28,9 @@ struct MetadataOptions {
   // that later allocations find blocks whose grace period is over.
   double evictBelow{0.1};
   double evictUntil{0.2};
+  // The file that keeps refs across restarts; none if empty, and then refs
+  // are gone when the metadata server stops.
+  std::string journal;
 };
 
 // The metadata server's state, in memory: the storage servers' regions and
@@ -38,9 +43,15 @@ struct MetadataOptions {
 // or looked up chunks: they are gone (lookups fail with kNotFound), and
 // their blocks are reused after the grace period. If only blocks in their
 // grace period could satisfy an allocation, it waits for them.
+//
+// Refs are kept apart from the blocks, and with a journal every update is
+// on disk before the call returns.
 class Metadata : public rpc::MetadataRpc {
  public:
+  // Replays the journal, if any.
   explicit Metadata(MetadataOptions options = {});
+
+  ~Metadata() override;
 
   // A storage server that registers again (e.g. after a restart) replaces
   // its old regions; chunks with blocks in them are gone, as the tiers are
@@ -64,6 +75,19 @@ class Metadata : public rpc::MetadataRpc {
   folly::coro::Task<ChunkInfo> co_lookup(ChunkId id) override;
 
   folly::coro::Task<bool> co_remove(ChunkId id) override;
+
+  folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override;
+
+  folly::coro::Task<std::optional<Ref>> co_casRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion,
+      std::string value) override;
+
+  folly::coro::Task<std::vector<Ref>> co_listRefs(std::string prefix) override;
+
+  folly::coro::Task<bool> co_removeRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion) override;
 
   // For tests and status: blocks of 'tier' that allocate can hand out now,
   // and those waiting out their grace period.
@@ -149,6 +173,17 @@ class Metadata : public rpc::MetadataRpc {
   // Where the next allocation starts its round over the regions.
   RegionId nextAllocation_{0};
   size_t evictions_{0};
+
+  // Applies a journal record.
+  void replayLocked(folly::ByteRange record);
+
+  void appendLocked(const RecordWriter& record);
+
+  std::mutex refMutex_;
+  std::map<std::string, Ref> refs_;
+  // The version of the next update of any ref.
+  uint64_t nextVersion_{1};
+  std::unique_ptr<Journal> journal_;
 };
 
 } // namespace kiln::meta

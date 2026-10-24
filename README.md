@@ -21,8 +21,27 @@ Today Kiln has the chunk store core: the metadata server, DRAM and local-FS
 storage servers (both ephemeral: their data is gone when they stop), and the
 client, which reaches regions over TCP or, on the same host, by mapping their
 files. Tiers fill up to the storage servers' byte budgets and then evict
-their least recently used chunks. Refs, durable tiers and the catalog come
-next.
+their least recently used chunks. Refs are kept by the metadata server, in a
+journal that survives restarts. An object store interface
+(`kiln/objectstore`) has a local-directory backend. Write-through to durable
+tiers and the catalog come next.
+
+## Refs
+
+A ref is a small named value (name up to 256 bytes, value up to 1 KiB) with
+a version, e.g. a pointer to the chunk that holds a catalog's latest commit.
+Refs are updated with compare and swap: `co_casRef(name, expectedVersion,
+value)` sets the ref only if it is at `expectedVersion`, or, with
+`std::nullopt`, only if there is no such ref, and returns the updated ref, or
+`std::nullopt` if the version did not match. Versions grow with every update
+of any ref, so a ref that is removed and created again never repeats one.
+`co_listRefs(prefix)` lists refs by name, and `co_removeRef` removes one,
+optionally only at a given version.
+
+With `kiln_meta --journal=FILE`, every ref update is appended to the journal
+and synced to disk before the call returns, and a restarted metadata server
+replays it (and then rewrites it with just the current refs). Without a
+journal, refs are gone when the metadata server stops.
 
 ## Eviction
 
@@ -58,12 +77,16 @@ auto data = co_await client.co_read(id, offset, length, std::move(buffer));
 A cluster on this machine, and the command line client:
 
 ```
-metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server; -b budget_mb
+metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server; -b budget_mb, -j journal
 kiln() { $(buck2 build //bin:kiln --show-full-output | awk '{print $2}') --metadata=$metadata "$@"; }
 id=$(kiln put some/file)                # --tier=localfs for the local FS
 kiln stat $id
 kiln get $id copy                       # --tcp_only to skip shared memory
 kiln rm $id
+kiln ref set head $id                   # prints the ref's version
+kiln ref set head $other_id VERSION     # only if head is still at VERSION
+kiln ref get head
+kiln ref ls
 scripts/stop_local_cluster.sh
 ```
 
@@ -93,7 +116,9 @@ TCP over loopback, it measured:
 - `kiln/common`: chunk ids, buffers, the metadata types (`Types.h`), errors.
 - `kiln/rpc`: the metadata and storage interfaces (`MetadataRpc.h`,
   `StorageRpc.h`) and serving and calling them over fbthrift.
-- `kiln/meta`: the metadata server's state.
+- `kiln/meta`: the metadata server's state and its journal.
+- `kiln/objectstore`: the object store interface and its local-directory
+  backend.
 - `kiln/server`: the storage server and its regions.
 - `kiln/client`: the client library and its transports.
 - `kiln/local`: a whole cluster in one process, for tests, examples and

@@ -106,6 +106,29 @@ folly::coro::Task<bool> Client::co_remove(ChunkId id) {
   co_return co_await metadata_->co_remove(id);
 }
 
+folly::coro::Task<std::optional<Ref>> Client::co_getRef(std::string name) {
+  co_return co_await metadata_->co_getRef(std::move(name));
+}
+
+folly::coro::Task<std::optional<Ref>> Client::co_casRef(
+    std::string name,
+    std::optional<uint64_t> expectedVersion,
+    std::string value) {
+  co_return co_await metadata_->co_casRef(
+      std::move(name), expectedVersion, std::move(value));
+}
+
+folly::coro::Task<std::vector<Ref>> Client::co_listRefs(std::string prefix) {
+  co_return co_await metadata_->co_listRefs(std::move(prefix));
+}
+
+folly::coro::Task<bool> Client::co_removeRef(
+    std::string name,
+    std::optional<uint64_t> expectedVersion) {
+  co_return co_await metadata_->co_removeRef(
+      std::move(name), expectedVersion);
+}
+
 folly::coro::Task<std::vector<RegionInfo>> Client::co_regions(
     const std::vector<BlockRef>& blocks) {
   std::vector<RegionId> missing;

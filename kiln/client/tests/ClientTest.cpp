@@ -239,6 +239,38 @@ TEST_P(ClientTest, concurrentWriters) {
   }
 }
 
+TEST_P(ClientTest, refs) {
+  // The tests of both transports share the cluster.
+  const std::string prefix = GetParam() ? "shm/" : "tcp/";
+  const auto name = prefix + "head";
+  EXPECT_EQ(blockingWait(client_->co_getRef(name)), std::nullopt);
+  auto ref = blockingWait(client_->co_casRef(name, std::nullopt, "one"));
+  ASSERT_TRUE(ref);
+  EXPECT_EQ(blockingWait(client_->co_getRef(name)), ref);
+  EXPECT_EQ(
+      blockingWait(client_->co_casRef(name, std::nullopt, "two")),
+      std::nullopt);
+  // Values are bytes.
+  const std::string binary("a\0b", 3);
+  auto updated = blockingWait(client_->co_casRef(name, ref->version, binary));
+  ASSERT_TRUE(updated);
+  EXPECT_EQ(updated->value, binary);
+
+  blockingWait(client_->co_casRef(prefix + "other", std::nullopt, "x"));
+  auto refs = blockingWait(client_->co_listRefs(prefix));
+  ASSERT_EQ(refs.size(), 2);
+  EXPECT_EQ(refs[0], *updated);
+  EXPECT_FALSE(blockingWait(client_->co_removeRef(name, ref->version)));
+  EXPECT_TRUE(blockingWait(client_->co_removeRef(name, updated->version)));
+  EXPECT_TRUE(blockingWait(client_->co_removeRef(prefix + "other")));
+  try {
+    blockingWait(client_->co_casRef("", std::nullopt, "x"));
+    FAIL() << "Set a ref without a name";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kInvalidArgument);
+  }
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Transports,
     ClientTest,

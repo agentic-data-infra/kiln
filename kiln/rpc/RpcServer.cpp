@@ -93,7 +93,42 @@ class MetadataService
     co_return co_await guarded(metadata_->co_remove(fromThrift(*id)));
   }
 
+  folly::coro::Task<std::unique_ptr<thrift::RefLookup>> co_getRef(
+      std::unique_ptr<std::string> name) override {
+    auto result = co_await guarded(metadata_->co_getRef(std::move(*name)));
+    co_return boxed(toThrift(result));
+  }
+
+  folly::coro::Task<std::unique_ptr<thrift::RefLookup>> co_casRef(
+      std::unique_ptr<thrift::CasRefRequest> request) override {
+    auto result = co_await guarded(metadata_->co_casRef(
+        std::move(*request->name()),
+        versionOf(request->expectedVersion()),
+        std::move(*request->value())));
+    co_return boxed(toThrift(result));
+  }
+
+  folly::coro::Task<std::unique_ptr<std::vector<thrift::Ref>>> co_listRefs(
+      std::unique_ptr<std::string> prefix) override {
+    auto result = co_await guarded(metadata_->co_listRefs(std::move(*prefix)));
+    co_return boxed(toThrift(result));
+  }
+
+  folly::coro::Task<bool> co_removeRef(
+      std::unique_ptr<thrift::RemoveRefRequest> request) override {
+    co_return co_await guarded(metadata_->co_removeRef(
+        std::move(*request->name()), versionOf(request->expectedVersion())));
+  }
+
  private:
+  template <typename Field>
+  static std::optional<uint64_t> versionOf(Field field) {
+    if (!field) {
+      return std::nullopt;
+    }
+    return static_cast<uint64_t>(*field);
+  }
+
   const std::shared_ptr<MetadataRpc> metadata_;
 };
 

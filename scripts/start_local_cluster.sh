@@ -4,7 +4,7 @@
 #
 #   scripts/start_local_cluster.sh [-d dram_servers] [-l localfs_servers]
 #       [-r regions_per_server] [-s region_size_mb] [-b budget_mb]
-#       [-g grace_period_s] [-p metadata_port]
+#       [-g grace_period_s] [-p metadata_port] [-j journal_file]
 #
 # Prints the metadata endpoint for `kiln --metadata=` (or $KILN_METADATA).
 # Logs and pids go to $KILN_CLUSTER_DIR (default <tmp>/kiln-cluster); stop
@@ -18,7 +18,8 @@ region_size_mb=1024
 budget_mb=0
 grace_period_s=30
 port=7470
-while getopts "d:l:r:s:b:g:p:" opt; do
+journal=
+while getopts "d:l:r:s:b:g:p:j:" opt; do
   case $opt in
     d) dram=$OPTARG ;;
     l) localfs=$OPTARG ;;
@@ -27,6 +28,7 @@ while getopts "d:l:r:s:b:g:p:" opt; do
     b) budget_mb=$OPTARG ;;
     g) grace_period_s=$OPTARG ;;
     p) port=$OPTARG ;;
+    j) journal=$OPTARG ;;
     *) exit 2 ;;
   esac
 done
@@ -46,7 +48,8 @@ bin() {
 meta_bin=$(bin kiln_meta)
 server_bin=$(bin kiln_server)
 
-"$meta_bin" --port="$port" --grace_period_s="$grace_period_s" >"$cluster_dir/meta.log" 2>&1 &
+"$meta_bin" --port="$port" --grace_period_s="$grace_period_s" --journal="$journal" \
+  >"$cluster_dir/meta.log" 2>&1 &
 echo $! >>"$cluster_dir/pids"
 
 start_server() {

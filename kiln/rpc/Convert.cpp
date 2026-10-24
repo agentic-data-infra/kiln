@@ -119,6 +119,36 @@ ChunkInfo fromThrift(const thrift::ChunkInfo& chunk) {
       .placement = fromThrift(*chunk.placement())};
 }
 
+thrift::Ref toThrift(const Ref& ref) {
+  thrift::Ref result;
+  result.name() = ref.name;
+  result.value() = ref.value;
+  result.version() = static_cast<int64_t>(ref.version);
+  return result;
+}
+
+Ref fromThrift(const thrift::Ref& ref) {
+  return Ref{
+      .name = *ref.name(),
+      .value = *ref.value(),
+      .version = static_cast<uint64_t>(*ref.version())};
+}
+
+thrift::RefLookup toThrift(const std::optional<Ref>& ref) {
+  thrift::RefLookup result;
+  if (ref) {
+    result.ref() = toThrift(*ref);
+  }
+  return result;
+}
+
+std::optional<Ref> fromThrift(const thrift::RefLookup& lookup) {
+  if (!lookup.ref()) {
+    return std::nullopt;
+  }
+  return fromThrift(*lookup.ref());
+}
+
 thrift::KilnException toThrift(const Error& error) {
   thrift::KilnException result;
   result.code() = static_cast<thrift::ErrorCode>(error.code());

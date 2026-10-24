@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <folly/coro/BlockingWait.h>
+#include <folly/testing/TestUtil.h>
 
 #include "kiln/common/Error.h"
 #include "kiln/meta/Metadata.h"
@@ -275,6 +276,107 @@ TEST(MetadataTest, reregisteringDropsOldRegionsAndChunks) {
   registerServer(metadata, "a:1", Tier::kDram, {2});
   EXPECT_EQ(metadata.chunkCount(), 0);
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 2);
+}
+
+std::optional<Ref> cas(
+    Metadata& metadata,
+    const std::string& name,
+    std::optional<uint64_t> expectedVersion,
+    const std::string& value) {
+  return blockingWait(metadata.co_casRef(name, expectedVersion, value));
+}
+
+TEST(MetadataTest, refsCompareAndSwap) {
+  Metadata metadata;
+  EXPECT_EQ(blockingWait(metadata.co_getRef("a")), std::nullopt);
+
+  auto a = cas(metadata, "a", std::nullopt, "one");
+  ASSERT_TRUE(a);
+  EXPECT_EQ(a->value, "one");
+  EXPECT_EQ(blockingWait(metadata.co_getRef("a")), a);
+  // Only if absent.
+  EXPECT_EQ(cas(metadata, "a", std::nullopt, "two"), std::nullopt);
+  // Only at the expected version.
+  EXPECT_EQ(cas(metadata, "a", a->version + 1, "two"), std::nullopt);
+  auto updated = cas(metadata, "a", a->version, "two");
+  ASSERT_TRUE(updated);
+  EXPECT_GT(updated->version, a->version);
+  EXPECT_EQ(blockingWait(metadata.co_getRef("a"))->value, "two");
+
+  EXPECT_FALSE(blockingWait(metadata.co_removeRef("a", a->version)));
+  EXPECT_TRUE(blockingWait(metadata.co_removeRef("a", updated->version)));
+  EXPECT_FALSE(blockingWait(metadata.co_removeRef("a", std::nullopt)));
+  // A recreated ref has a new version.
+  auto recreated = cas(metadata, "a", std::nullopt, "one");
+  EXPECT_GT(recreated->version, updated->version);
+  EXPECT_TRUE(blockingWait(metadata.co_removeRef("a", std::nullopt)));
+}
+
+TEST(MetadataTest, listRefs) {
+  Metadata metadata;
+  for (const auto* name : {"memo/b", "memo/a", "memos", "head"}) {
+    cas(metadata, name, std::nullopt, name);
+  }
+  auto names = [&](const std::string& prefix) {
+    std::vector<std::string> result;
+    for (const auto& ref : blockingWait(metadata.co_listRefs(prefix))) {
+      result.push_back(ref.name);
+    }
+    return result;
+  };
+  using Names = std::vector<std::string>;
+  EXPECT_EQ(names("memo/"), (Names{"memo/a", "memo/b"}));
+  EXPECT_EQ(names("memo"), (Names{"memo/a", "memo/b", "memos"}));
+  EXPECT_EQ(names(""), (Names{"head", "memo/a", "memo/b", "memos"}));
+  EXPECT_EQ(names("x"), Names{});
+}
+
+TEST(MetadataTest, refLimits) {
+  Metadata metadata;
+  auto casError = [&](std::string name, std::string value) {
+    return errorOf([&]() -> folly::coro::Task<void> {
+      co_await metadata.co_casRef(name, std::nullopt, value);
+    }());
+  };
+  EXPECT_EQ(casError("", "v"), ErrorCode::kInvalidArgument);
+  EXPECT_EQ(
+      casError(std::string(kMaxRefNameSize + 1, 'n'), "v"),
+      ErrorCode::kInvalidArgument);
+  EXPECT_EQ(
+      casError("n", std::string(kMaxRefValueSize + 1, 'v')),
+      ErrorCode::kInvalidArgument);
+  EXPECT_TRUE(cas(
+      metadata,
+      std::string(kMaxRefNameSize, 'n'),
+      std::nullopt,
+      std::string(kMaxRefValueSize, 'v')));
+}
+
+TEST(MetadataTest, refsSurviveRestartWithJournal) {
+  folly::test::TemporaryDirectory dir;
+  MetadataOptions options;
+  options.journal = dir.path().string() + "/journal";
+  uint64_t lastVersion = 0;
+  {
+    Metadata metadata(options);
+    auto a = cas(metadata, "a", std::nullopt, "one");
+    cas(metadata, "a", a->version, "two");
+    cas(metadata, "b", std::nullopt, "b");
+    auto c = cas(metadata, "c", std::nullopt, "c");
+    blockingWait(metadata.co_removeRef("b", std::nullopt));
+    blockingWait(metadata.co_removeRef("c", std::nullopt));
+    lastVersion = c->version;
+  }
+  for (int restart = 0; restart < 2; ++restart) {
+    Metadata metadata(options);
+    auto refs = blockingWait(metadata.co_listRefs(""));
+    ASSERT_EQ(refs.size(), 1);
+    EXPECT_EQ(refs[0].name, "a");
+    EXPECT_EQ(refs[0].value, "two");
+  }
+  // Versions of removed refs are not handed out again.
+  Metadata metadata(options);
+  EXPECT_GT(cas(metadata, "c", std::nullopt, "c")->version, lastVersion);
 }
 
 } // namespace

@@ -1,9 +1,11 @@
 // kiln_meta: Kiln's metadata server.
 //
 //   kiln_meta [--port=P] [--bind_host=name] [--grace_period_s=S]
+//             [--journal=FILE]
 //
 // Storage servers register their regions here, and clients ask it for blocks
-// and where chunks are. Its state is in memory. Stops on SIGINT or SIGTERM.
+// and where chunks are, and for refs. Its state is in memory; with a journal,
+// refs survive restarts. Stops on SIGINT or SIGTERM.
 
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
@@ -19,6 +21,10 @@ DEFINE_int32(
     grace_period_s,
     30,
     "Seconds before blocks of removed or evicted chunks are reused.");
+DEFINE_string(
+    journal,
+    "",
+    "File that keeps refs across restarts; without one they are lost.");
 
 int main(int argc, char** argv) {
   FLAGS_logtostderr = true;
@@ -27,7 +33,8 @@ int main(int argc, char** argv) {
 
   auto metadata =
       std::make_shared<kiln::meta::Metadata>(kiln::meta::MetadataOptions{
-          .gracePeriod = std::chrono::seconds(FLAGS_grace_period_s)});
+          .gracePeriod = std::chrono::seconds(FLAGS_grace_period_s),
+          .journal = FLAGS_journal});
   auto server = kiln::rpc::serveMetadata(
       metadata, FLAGS_bind_host, static_cast<uint16_t>(FLAGS_port));
   LOG(INFO) << "Metadata server on port " << server->port();

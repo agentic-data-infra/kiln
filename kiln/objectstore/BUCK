@@ -1,0 +1,8 @@
+cxx_library(
+    name = "objectstore",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/objectstore",
+    exported_headers = glob(["*.h"]),
+    exported_deps = ["//kiln/common:common"],
+    visibility = ["PUBLIC"],
+)

@@ -1,6 +1,9 @@
 cxx_test(
     name = "metadata_test",
-    srcs = ["MetadataTest.cpp"],
+    srcs = [
+        "JournalTest.cpp",
+        "MetadataTest.cpp",
+    ],
     deps = [
         "//kiln/meta:meta",
         "//kiln/tests:test_main",
