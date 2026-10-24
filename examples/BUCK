@@ -1,0 +1,20 @@
+cxx_binary(
+    name = "put_get_file",
+    srcs = ["PutGetFile.cpp"],
+    deps = [
+        "//kiln/client:client",
+        "//kiln/local:local",
+    ],
+    # Archives must precede the prebuilt libraries they use.
+    link_ordering = "topological",
+)
+
+cxx_binary(
+    name = "range_read",
+    srcs = ["RangeRead.cpp"],
+    deps = [
+        "//kiln/client:client",
+        "//kiln/local:local",
+    ],
+    link_ordering = "topological",
+)

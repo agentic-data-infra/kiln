@@ -5,6 +5,7 @@
 #include <folly/io/IOBuf.h>
 
 #include "kiln/common/ChunkId.h"
+#include "kiln/common/Error.h"
 
 namespace kiln {
 namespace {
@@ -33,6 +34,22 @@ TEST(ChunkIdTest, chainHashesLikeContiguousBytes) {
   chain->appendToChain(folly::IOBuf::copyBuffer(data.substr(17)));
   ASSERT_TRUE(chain->isChained());
   EXPECT_EQ(ChunkId::of(*chain), ChunkId::of(folly::StringPiece{data}));
+}
+
+TEST(ChunkIdTest, hasherMatchesOneShot) {
+  const std::string data(3 * 1000 + 7, 'x');
+  ChunkHasher hasher;
+  for (size_t i = 0; i < data.size(); i += 1000) {
+    hasher.update(folly::StringPiece{data}.subpiece(i, 1000));
+  }
+  EXPECT_EQ(hasher.id(), ChunkId::of(folly::StringPiece{data}));
+}
+
+TEST(ChunkIdTest, parse) {
+  const auto id = ChunkId::of(folly::StringPiece{"parse me"});
+  EXPECT_EQ(ChunkId::parse(id.toString()), id);
+  EXPECT_THROW(ChunkId::parse("abc"), Error);
+  EXPECT_THROW(ChunkId::parse(std::string(32, 'g')), Error);
 }
 
 TEST(ChunkIdTest, hashable) {

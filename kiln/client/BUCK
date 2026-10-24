@@ -1,0 +1,10 @@
+cxx_library(
+    name = "client",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/client",
+    exported_headers = ["Client.h"],
+    headers = ["Transport.h"],
+    exported_deps = ["//kiln/common:common"],
+    deps = ["//kiln/rpc:rpc"],
+    visibility = ["PUBLIC"],
+)

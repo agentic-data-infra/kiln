@@ -1,0 +1,14 @@
+# The in-process test mode: a whole cluster in one process.
+
+cxx_library(
+    name = "local",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/local",
+    exported_headers = glob(["*.h"]),
+    exported_deps = [
+        "//kiln/meta:meta",
+        "//kiln/server:server",
+    ],
+    deps = ["//kiln/rpc:rpc"],
+    visibility = ["PUBLIC"],
+)

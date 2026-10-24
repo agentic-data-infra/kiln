@@ -1,0 +1,10 @@
+cxx_test(
+    name = "region_test",
+    srcs = ["RegionTest.cpp"],
+    deps = [
+        "//kiln/server:server",
+        "//kiln/tests:test_main",
+    ],
+    # Archives must precede the prebuilt libraries they use.
+    link_ordering = "topological",
+)

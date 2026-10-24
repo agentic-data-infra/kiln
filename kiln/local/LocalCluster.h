@@ -1,0 +1,57 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "kiln/common/Types.h"
+#include "kiln/meta/Metadata.h"
+#include "kiln/server/StorageServer.h"
+
+namespace kiln::rpc {
+class RpcServer;
+}
+
+namespace kiln::local {
+
+struct LocalClusterOptions {
+  uint32_t dramServers{2};
+  uint32_t localFsServers{2};
+  uint32_t regionsPerServer{1};
+  uint64_t regionSize{64 << 20};
+  // Where local-FS regions go; empty for the storage server's default.
+  std::string localFsDir;
+};
+
+// A metadata server and storage servers in this process, for tests,
+// examples and benchmarks. They serve on 127.0.0.1 like separate processes
+// would, so clients use them as they would a real cluster.
+class LocalCluster {
+ public:
+  explicit LocalCluster(LocalClusterOptions options = {});
+
+  ~LocalCluster();
+
+  // The metadata server, for ClientOptions::metadata.
+  const Endpoint& metadataEndpoint() const {
+    return metadataEndpoint_;
+  }
+
+  // The metadata server's state, e.g. to check free blocks in tests.
+  const meta::Metadata& metadata() const {
+    return *metadata_;
+  }
+
+  const std::vector<std::unique_ptr<server::StorageServer>>& servers() const {
+    return servers_;
+  }
+
+ private:
+  std::shared_ptr<meta::Metadata> metadata_;
+  std::unique_ptr<rpc::RpcServer> metadataServer_;
+  Endpoint metadataEndpoint_;
+  std::vector<std::unique_ptr<server::StorageServer>> servers_;
+};
+
+} // namespace kiln::local

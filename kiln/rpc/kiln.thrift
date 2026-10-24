@@ -1,14 +1,126 @@
-// The service between Kiln clients and the metadata server. Compiled by
-// thrift1 into kiln/rpc/gen-cpp2 (see BUCK).
-//
-// Only ping for now: it proves code generation and coroutine (co_*) clients
-// and handlers.
+// Kiln's services: the metadata server's (MetadataService) and the storage
+// servers' (StorageService). Compiled by thrift1 into kiln/rpc/gen-cpp2 (see
+// BUCK). The types mirror kiln/common/Types.h.
 
 package "kiln.dev/rpc"
 
 namespace cpp2 kiln.rpc.thrift
 
+include "thrift/annotation/cpp.thrift"
+include "thrift/annotation/thrift.thrift"
+
+/// Bytes received into, and sent from, an IOBuf without copying.
+@cpp.Type{name = "folly::IOBuf"}
+typedef binary IOBuf
+
+/// kiln::ErrorCode.
+enum ErrorCode {
+  NOT_FOUND = 0,
+  OUT_OF_SPACE = 1,
+  INVALID_ARGUMENT = 2,
+  UNAVAILABLE = 3,
+  INTERNAL = 4,
+}
+
+/// A kiln::Error thrown by a handler.
+exception KilnException {
+  1: ErrorCode code;
+  @thrift.ExceptionMessage
+  2: string message;
+}
+
+enum Tier {
+  DRAM = 0,
+  LOCAL_FS = 1,
+}
+
+struct Endpoint {
+  1: string host;
+  2: i32 port;
+}
+
+struct TcpAccess {
+  1: Endpoint endpoint;
+}
+
+struct ShmAccess {
+  1: string host;
+  2: string path;
+}
+
+struct RdmaAccess {
+  1: Endpoint endpoint;
+  2: i64 rkey;
+  3: i64 baseAddress;
+}
+
+struct RegionInfo {
+  1: i64 id;
+  2: string server;
+  3: Tier tier;
+  4: i64 length;
+  5: optional TcpAccess tcp;
+  6: optional ShmAccess shm;
+  7: optional RdmaAccess rdma;
+}
+
+struct BlockRef {
+  1: i64 region;
+  2: i64 offset;
+  3: i64 length;
+}
+
+struct ChunkId {
+  1: i64 high;
+  2: i64 low;
+}
+
+struct Placement {
+  1: Tier tier;
+}
+
+struct ChunkInfo {
+  1: ChunkId id;
+  2: i64 size;
+  3: list<BlockRef> blocks;
+  4: Placement placement;
+}
+
 service MetadataService {
   /// Returns 'message'.
   string ping(1: string message);
+
+  /// A storage server offers its regions; returns them with their ids.
+  list<RegionInfo> registerServer(1: list<RegionInfo> regions) throws (
+    1: KilnException e,
+  );
+
+  list<RegionInfo> getRegions(1: list<i64> ids) throws (1: KilnException e);
+
+  /// 'count' free blocks of length kBlockSize in the placement's tier.
+  list<BlockRef> allocate(1: Placement placement, 2: i32 count) throws (
+    1: KilnException e,
+  );
+
+  /// Returns blocks that allocate() handed out to the free lists.
+  void free(1: list<BlockRef> blocks) throws (1: KilnException e);
+
+  /// Makes a chunk visible. The first commit of an id wins: later ones get
+  /// the first one's chunk and their blocks are freed.
+  ChunkInfo commit(1: ChunkInfo chunk) throws (1: KilnException e);
+
+  ChunkInfo lookup(1: ChunkId id) throws (1: KilnException e);
+
+  /// Returns whether the chunk existed. Its blocks are freed.
+  bool remove(1: ChunkId id) throws (1: KilnException e);
+}
+
+service StorageService {
+  IOBuf read(1: i64 region, 2: i64 offset, 3: i64 length) throws (
+    1: KilnException e,
+  );
+
+  void write(1: i64 region, 2: i64 offset, 3: IOBuf data) throws (
+    1: KilnException e,
+  );
 }

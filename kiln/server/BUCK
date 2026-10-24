@@ -1,0 +1,8 @@
+cxx_library(
+    name = "server",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/server",
+    exported_headers = glob(["*.h"]),
+    exported_deps = ["//kiln/rpc:rpc"],
+    visibility = ["PUBLIC"],
+)
