@@ -1,0 +1,12 @@
+load("//kiln:options.bzl", "OPTION_FLAGS")
+
+cxx_library(
+    name = "common",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/common",
+    exported_headers = glob(["*.h"]),
+    exported_preprocessor_flags = OPTION_FLAGS,
+    exported_deps = ["//third-party:fbthrift"],
+    deps = ["//third-party:xxhash"],
+    visibility = ["PUBLIC"],
+)
