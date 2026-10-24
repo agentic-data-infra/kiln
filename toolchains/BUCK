@@ -4,14 +4,18 @@ load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 
-# GCC, the compiler Velox's setup scripts build folly and fbthrift with.
+# GCC 12. folly and fbthrift are built with GCC 11 by Velox's setup scripts
+# (same libstdc++ ABI), but GCC 11 miscompiles co_await in coroutine templates
+# with this folly, which rules out e.g. fbthrift's generated co_* clients.
 system_cxx_toolchain(
     name = "cxx",
-    compiler = "gcc",
+    compiler = "gcc-12",
     compiler_type = "gcc",
-    cxx_compiler = "g++",
-    linker = "g++",
+    cxx_compiler = "g++-12",
+    linker = "g++-12",
     cxx_flags = ["-std=c++20", "-fcoroutines"],
+    # The prelude asks for lld with any compiler but "g++"; use GNU ld.
+    link_flags = ["-fuse-ld=bfd"],
     link_style = "static",
     visibility = ["PUBLIC"],
 )

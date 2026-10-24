@@ -33,7 +33,7 @@ Velox's setup script (`velox/scripts/setup-ubuntu.sh`) installs under
 `/usr/local`, and the system gtest (`libgtest-dev`). They are wrapped as
 prebuilt libraries; Kiln does not depend on Velox itself.
 
-Prerequisites: GCC 11+, cmake, ninja, and buck2 on `PATH`.
+Prerequisites: GCC 12 (`g++-12`), cmake, ninja, and buck2 on `PATH`.
 
 ```
 # Generate third-party/generated/deps.bzl from the installed fbthrift.
@@ -48,7 +48,6 @@ Re-run `scripts/gen_third_party.py` whenever folly or fbthrift are reinstalled.
 Optional backends are build options in `.buckconfig`, off by default:
 `-c kiln.rdma=true` and `-c kiln.s3=true` (no code behind them yet).
 
+Kiln builds with GCC 12 although folly and fbthrift are built with GCC 11:
 GCC 11 miscompiles `co_await` inside coroutine templates with the installed
-folly, so Kiln's coroutines are not templates, and Kiln calls fbthrift clients'
-`semifuture_*` methods from its coroutines rather than the generated `co_*`
-ones (which are templates). Coroutine handlers (`co_*` overrides) work.
+folly, which rules out fbthrift's generated `co_*` clients.
