@@ -4,9 +4,9 @@ load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 
-# GCC 12. folly and fbthrift are built with GCC 11 by Velox's setup scripts
-# (same libstdc++ ABI), but GCC 11 miscompiles co_await in coroutine templates
-# with this folly, which rules out e.g. fbthrift's generated co_* clients.
+# GCC 12, as folly and fbthrift are built with (scripts/gen_third_party.py).
+# GCC 11 miscompiles co_await in coroutine templates with this folly, which
+# rules out e.g. fbthrift's generated co_* clients.
 system_cxx_toolchain(
     name = "cxx",
     compiler = "gcc-12",
@@ -18,12 +18,6 @@ system_cxx_toolchain(
         "-fcoroutines",
         # The prelude adds no optimization flags of its own.
         "-O2",
-        # Keep folly's layouts identical to its GCC 11 build: GCC 12's
-        # std::hardware_destructive_interference_size (64 on x86) would
-        # replace folly's own 128, and its constexpr std::vector would change
-        # folly's compression context pools.
-        "--param=destructive-interference-size=128",
-        "-DFOLLY_COMPRESSION_HAS_CONSTEXPR_VECTOR=0",
     ],
     # The prelude asks for lld with any compiler but "g++"; use GNU ld.
     link_flags = ["-fuse-ld=bfd"],
