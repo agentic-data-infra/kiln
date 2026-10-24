@@ -5,6 +5,9 @@ cxx_library(
     exported_headers = ["Client.h"],
     headers = ["Transport.h"],
     exported_deps = ["//kiln/common:common"],
-    deps = ["//kiln/rpc:rpc"],
+    deps = [
+        "//kiln/objectstore:objectstore",
+        "//kiln/rpc:rpc",
+    ],
     visibility = ["PUBLIC"],
 )

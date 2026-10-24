@@ -106,7 +106,7 @@ TEST_P(ClientTest, putAndGet) {
 
       const auto info = blockingWait(client_->co_stat(id));
       EXPECT_EQ(info.size, size);
-      EXPECT_EQ(info.blocks.size(), (size + kBlockSize - 1) / kBlockSize);
+      EXPECT_EQ(info.replicas[0].blocks.size(), (size + kBlockSize - 1) / kBlockSize);
       EXPECT_EQ(info.placement.tier, tier);
       EXPECT_TRUE(blockingWait(client_->co_remove(id)));
     }
@@ -117,7 +117,7 @@ TEST_P(ClientTest, blocksSpreadOverServers) {
   const auto id = put(bytes(8 << 20));
   const auto info = blockingWait(client_->co_stat(id));
   std::set<RegionId> regions;
-  for (const auto& block : info.blocks) {
+  for (const auto& block : info.replicas[0].blocks) {
     regions.insert(block.region);
   }
   // Two DRAM servers with two regions each.
@@ -165,7 +165,7 @@ TEST_P(ClientTest, firstCommitWins) {
   const auto freeBefore = metadata.freeBlocks(Tier::kDram);
   const auto data = bytes(3 << 20, 42);
   const auto first = put(data);
-  const auto blocks = blockingWait(client_->co_stat(first)).blocks;
+  const auto blocks = blockingWait(client_->co_stat(first)).replicas[0].blocks;
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore - 3);
 
   // A second client writes the same bytes: same id, same blocks, and its
@@ -175,7 +175,7 @@ TEST_P(ClientTest, firstCommitWins) {
   auto writer = blockingWait(other.co_create());
   blockingWait(writer->co_append(toBuffer(other, data)));
   EXPECT_EQ(blockingWait(writer->co_commit()), first);
-  EXPECT_EQ(blockingWait(other.co_stat(first)).blocks, blocks);
+  EXPECT_EQ(blockingWait(other.co_stat(first)).replicas[0].blocks, blocks);
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore - 3);
 
   blockingWait(client_->co_remove(first));

@@ -33,8 +33,10 @@ ChunkId commit(Metadata& metadata, uint64_t id, uint32_t blocks, Tier tier = Tie
   ChunkInfo chunk{
       .id = ChunkId{id, id},
       .size = blocks * kBlockSize,
-      .blocks = blockingWait(metadata.co_allocate(Placement{.tier = tier}, blocks)),
-      .placement = Placement{.tier = tier}};
+      .placement = Placement{.tier = tier},
+      .replicas = {Replica{
+          .tier = tier,
+          .blocks = blockingWait(metadata.co_allocate(tier, blocks))}}};
   return blockingWait(metadata.co_commit(std::move(chunk))).id;
 }
 
@@ -95,7 +97,7 @@ TEST(MetadataTest, allocateRoundRobin) {
   registerServer(metadata, "b:1", Tier::kDram, {4});
   registerServer(metadata, "c:1", Tier::kLocalFs, {4});
 
-  auto blocks = blockingWait(metadata.co_allocate(Placement{}, 6));
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 6));
   ASSERT_EQ(blocks.size(), 6);
   std::map<RegionId, int> perRegion;
   for (const auto& block : blocks) {
@@ -112,7 +114,7 @@ TEST(MetadataTest, allocateRoundRobin) {
   // Blocks being written cannot be evicted.
   EXPECT_EQ(
       errorOf([&]() -> folly::coro::Task<void> {
-        co_await metadata.co_allocate(Placement{}, 3);
+        co_await metadata.co_allocate(Tier::kDram, 3);
       }()),
       ErrorCode::kOutOfSpace);
   blockingWait(metadata.co_free(blocks));
@@ -125,11 +127,11 @@ TEST(MetadataTest, budgetLimitsAllocation) {
   // 8 blocks of regions, 3 of them usable.
   registerServer(metadata, "a:1", Tier::kDram, {4, 4}, 3);
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 3);
-  auto blocks = blockingWait(metadata.co_allocate(Placement{}, 3));
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 3));
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 0);
   EXPECT_EQ(
       errorOf([&]() -> folly::coro::Task<void> {
-        co_await metadata.co_allocate(Placement{}, 1);
+        co_await metadata.co_allocate(Tier::kDram, 1);
       }()),
       ErrorCode::kOutOfSpace);
   blockingWait(metadata.co_free(blocks));
@@ -139,20 +141,22 @@ TEST(MetadataTest, budgetLimitsAllocation) {
 TEST(MetadataTest, commitLookupRemove) {
   Metadata metadata(exact());
   registerServer(metadata, "a:1", Tier::kDram, {4});
-  auto blocks = blockingWait(metadata.co_allocate(Placement{}, 2));
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 2));
   blocks[1].length = 10;
   const ChunkInfo chunk{
-      .id = ChunkId{1, 2}, .size = kBlockSize + 10, .blocks = blocks};
+      .id = ChunkId{1, 2},
+      .size = kBlockSize + 10,
+      .replicas = {Replica{.blocks = blocks}}};
 
   EXPECT_EQ(blockingWait(metadata.co_commit(chunk)), chunk);
   EXPECT_EQ(blockingWait(metadata.co_lookup(chunk.id)), chunk);
 
   // A second commit of the id gets the first chunk; its blocks are free at
   // once, as nobody has seen them.
-  auto other = blockingWait(metadata.co_allocate(Placement{}, 2));
+  auto other = blockingWait(metadata.co_allocate(Tier::kDram, 2));
   other[1].length = 10;
   auto duplicate = chunk;
-  duplicate.blocks = other;
+  duplicate.replicas[0].blocks = other;
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 0);
   EXPECT_EQ(blockingWait(metadata.co_commit(duplicate)), chunk);
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 2);
@@ -166,8 +170,9 @@ TEST(MetadataTest, commitLookupRemove) {
 TEST(MetadataTest, commitChecksBlocks) {
   Metadata metadata;
   registerServer(metadata, "a:1", Tier::kDram, {4});
-  auto blocks = blockingWait(metadata.co_allocate(Placement{}, 1));
-  ChunkInfo wrongSize{.id = ChunkId{1, 2}, .size = 5, .blocks = blocks};
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 1));
+  ChunkInfo wrongSize{
+      .id = ChunkId{1, 2}, .size = 5, .replicas = {Replica{.blocks = blocks}}};
   EXPECT_EQ(
       errorOf([&]() -> folly::coro::Task<void> {
         co_await metadata.co_commit(wrongSize);
@@ -176,7 +181,8 @@ TEST(MetadataTest, commitChecksBlocks) {
   ChunkInfo noRegion{
       .id = ChunkId{1, 2},
       .size = 5,
-      .blocks = {BlockRef{.region = 999, .length = 5}}};
+      .replicas = {
+          Replica{.blocks = {BlockRef{.region = 999, .length = 5}}}}};
   EXPECT_EQ(
       errorOf([&]() -> folly::coro::Task<void> {
         co_await metadata.co_commit(noRegion);
@@ -185,8 +191,8 @@ TEST(MetadataTest, commitChecksBlocks) {
   ChunkInfo wrongTier{
       .id = ChunkId{1, 2},
       .size = kBlockSize,
-      .blocks = blocks,
-      .placement = Placement{.tier = Tier::kLocalFs}};
+      .placement = Placement{.tier = Tier::kLocalFs},
+      .replicas = {Replica{.tier = Tier::kLocalFs, .blocks = blocks}}};
   EXPECT_EQ(
       errorOf([&]() -> folly::coro::Task<void> {
         co_await metadata.co_commit(wrongTier);
@@ -217,7 +223,7 @@ TEST(MetadataTest, evictsLeastRecentlyUsed) {
   // A chunk bigger than the tier cannot be made room for.
   EXPECT_EQ(
       errorOf([&]() -> folly::coro::Task<void> {
-        co_await metadata.co_allocate(Placement{}, 11);
+        co_await metadata.co_allocate(Tier::kDram, 11);
       }()),
       ErrorCode::kOutOfSpace);
 }
@@ -231,7 +237,7 @@ TEST(MetadataTest, evictsAheadOfNeed) {
   }
   // Allocating 3 of the 4 free blocks would leave less than a quarter
   // free: evict until 3 + half the budget are available.
-  blockingWait(metadata.co_allocate(Placement{}, 3));
+  blockingWait(metadata.co_allocate(Tier::kDram, 3));
   EXPECT_EQ(metadata.evictions(), 3);
   EXPECT_FALSE(exists(metadata, ChunkId{3, 3}));
   EXPECT_TRUE(exists(metadata, ChunkId{4, 4}));
@@ -248,7 +254,7 @@ TEST(MetadataTest, gracePeriodDelaysReuse) {
 
   // The allocation waits for the grace period instead of failing.
   const auto start = std::chrono::steady_clock::now();
-  auto blocks = blockingWait(metadata.co_allocate(Placement{}, 2));
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 2));
   EXPECT_EQ(blocks.size(), 2);
   EXPECT_GE(std::chrono::steady_clock::now() - start, 250ms);
   EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 0);
@@ -276,6 +282,132 @@ TEST(MetadataTest, reregisteringDropsOldRegionsAndChunks) {
   registerServer(metadata, "a:1", Tier::kDram, {2});
   EXPECT_EQ(metadata.chunkCount(), 0);
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 2);
+}
+
+TEST(MetadataTest, writeThroughCopies) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {4});
+  registerServer(metadata, "b:1", Tier::kLocalFs, {4});
+  const Placement placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs};
+  ChunkInfo chunk{
+      .id = ChunkId{1, 1},
+      .size = 2 * kBlockSize,
+      .placement = placement,
+      .replicas = {
+          Replica{
+              .tier = Tier::kDram,
+              .blocks = blockingWait(metadata.co_allocate(Tier::kDram, 2))},
+          Replica{
+              .tier = Tier::kLocalFs,
+              .blocks = blockingWait(metadata.co_allocate(Tier::kLocalFs, 2))}}};
+  EXPECT_EQ(blockingWait(metadata.co_commit(chunk)), chunk);
+
+  // Evicting the DRAM copy leaves the local-FS one.
+  commit(metadata, 2, 4);
+  auto left = blockingWait(metadata.co_lookup(chunk.id));
+  ASSERT_EQ(left.replicas.size(), 1);
+  EXPECT_EQ(left.replicas[0], chunk.replicas[1]);
+  EXPECT_EQ(metadata.evictions(), 1);
+
+  // Commits need a copy in each tier of the placement.
+  chunk.id = ChunkId{3, 3};
+  chunk.replicas.pop_back();
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_commit(chunk);
+      }()),
+      ErrorCode::kInvalidArgument);
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_allocate(Tier::kObjectStore, 1);
+      }()),
+      ErrorCode::kInvalidArgument);
+}
+
+TEST(MetadataTest, registeringAgainKeepsRegionsWithIds) {
+  Metadata metadata(exact());
+  auto regions = registerServer(metadata, "a:1", Tier::kLocalFs, {4});
+  const auto id = commit(metadata, 1, 3, Tier::kLocalFs);
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kLocalFs, 1));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 0);
+
+  // Same regions, maybe after a restart on another port.
+  for (auto& region : regions) {
+    region.server = "a:2";
+  }
+  blockingWait(metadata.co_registerServer(regions, 0));
+  EXPECT_TRUE(exists(metadata, id));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 0);
+  blockingWait(metadata.co_free(blocks));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 1);
+
+  // New regions: the chunk in the old ones is gone.
+  registerServer(metadata, "a:2", Tier::kLocalFs, {4});
+  EXPECT_FALSE(exists(metadata, id));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 4);
+}
+
+TEST(MetadataTest, journalKeepsWrittenThroughCopies) {
+  folly::test::TemporaryDirectory dir;
+  MetadataOptions options = exact();
+  options.journal = dir.path().string() + "/journal";
+  std::vector<RegionInfo> regions;
+  ChunkInfo durable;
+  ChunkInfo object;
+  ChunkId ephemeral;
+  {
+    Metadata metadata(options);
+    registerServer(metadata, "a:1", Tier::kDram, {4});
+    regions = registerServer(metadata, "b:1", Tier::kLocalFs, {4});
+    durable = ChunkInfo{
+        .id = ChunkId{1, 1},
+        .size = kBlockSize,
+        .placement = {.tier = Tier::kDram, .writeThrough = Tier::kLocalFs},
+        .replicas = {
+            Replica{
+                .tier = Tier::kDram,
+                .blocks = blockingWait(metadata.co_allocate(Tier::kDram, 1))},
+            Replica{
+                .tier = Tier::kLocalFs,
+                .blocks =
+                    blockingWait(metadata.co_allocate(Tier::kLocalFs, 1))}}};
+    blockingWait(metadata.co_commit(durable));
+    object = ChunkInfo{
+        .id = ChunkId{2, 2},
+        .size = kBlockSize,
+        .placement = {.tier = Tier::kDram, .writeThrough = Tier::kObjectStore},
+        .replicas = {
+            Replica{
+                .tier = Tier::kDram,
+                .blocks = blockingWait(metadata.co_allocate(Tier::kDram, 1))},
+            Replica{.tier = Tier::kObjectStore}}};
+    blockingWait(metadata.co_commit(object));
+    ephemeral = commit(metadata, 3, 2, Tier::kLocalFs);
+    // Removed: not back after the restart.
+    blockingWait(metadata.co_remove(commit(metadata, 4, 1, Tier::kLocalFs)));
+  }
+
+  Metadata metadata(options);
+  EXPECT_EQ(metadata.chunkCount(), 2);
+  EXPECT_EQ(
+      blockingWait(metadata.co_lookup(object.id)).replicas,
+      std::vector{object.replicas[1]});
+  // Not readable before its storage server registers again.
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_lookup(durable.id);
+      }()),
+      ErrorCode::kUnavailable);
+  blockingWait(metadata.co_registerServer(regions, 0));
+  EXPECT_EQ(
+      blockingWait(metadata.co_lookup(durable.id)).replicas,
+      std::vector{durable.replicas[1]});
+  EXPECT_FALSE(exists(metadata, ephemeral));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 3);
+  // The block in use is not handed out.
+  for (const auto& block : blockingWait(metadata.co_allocate(Tier::kLocalFs, 3))) {
+    EXPECT_NE(block, durable.replicas[1].blocks[0]);
+  }
 }
 
 std::optional<Ref> cas(

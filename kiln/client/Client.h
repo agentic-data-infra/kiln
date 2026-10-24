@@ -19,6 +19,10 @@ namespace kiln::rpc {
 class MetadataRpc;
 }
 
+namespace kiln::objectstore {
+class ObjectStore;
+}
+
 namespace kiln::client {
 
 class Transport;
@@ -34,6 +38,9 @@ struct ClientOptions {
   // (MetadataOptions::gracePeriod), after which the blocks of an evicted or
   // removed chunk are reused.
   std::chrono::milliseconds chunkCacheTtl{std::chrono::seconds(10)};
+  // The deployment's object store, to write chunks through to it and read
+  // their copies there; none if unset.
+  std::shared_ptr<objectstore::ObjectStore> objectStore;
 };
 
 class ChunkWriter;
@@ -59,21 +66,24 @@ class Client {
   // alive while the buffer is in use.
   Buffer registerMemory(void* data, size_t length);
 
-  // Starts a new chunk in the placement's tier.
+  // Starts a new chunk in the placement's tier, and its write-through
+  // tier if set.
   folly::coro::Task<std::unique_ptr<ChunkWriter>> co_create(
       Placement placement = {});
 
   // Reads up to 'length' bytes of the chunk at 'offset' into 'dst', which
   // must have the capacity; returns it with its size set to the bytes read
-  // (fewer at the end of the chunk). Fails with kNotFound for no such chunk
-  // and kInvalidArgument for an offset past its end.
+  // (fewer at the end of the chunk). Reads the fastest copy it can reach.
+  // Fails with kNotFound for no such chunk and kInvalidArgument for an
+  // offset past its end.
   folly::coro::Task<Buffer>
   co_read(ChunkId id, uint64_t offset, uint64_t length, Buffer&& dst);
 
-  // The chunk's size and blocks. Fails with kNotFound for no such chunk.
+  // The chunk's size and copies. Fails with kNotFound for no such chunk.
   folly::coro::Task<ChunkInfo> co_stat(ChunkId id);
 
-  // Returns whether the chunk existed.
+  // Returns whether the chunk existed. Its object in the object store, if
+  // any, stays.
   folly::coro::Task<bool> co_remove(ChunkId id);
 
   // Refs: small named values on the metadata server, updated with compare
@@ -102,6 +112,14 @@ class Client {
  private:
   friend class ChunkWriter;
 
+  // Reads 'length' bytes of the chunk's copy at 'offset' into 'dst'.
+  folly::coro::Task<void> co_readReplica(
+      ChunkId id,
+      const Replica& replica,
+      uint64_t offset,
+      uint64_t length,
+      uint8_t* dst);
+
   // The regions of 'blocks', from the cache or the metadata server.
   folly::coro::Task<std::vector<RegionInfo>> co_regions(
       const std::vector<BlockRef>& blocks);
@@ -129,8 +147,10 @@ class Client {
 };
 
 // Writes one chunk: append its bytes, then commit to get its id. The bytes
-// go to the storage servers as they are appended and are hashed on the way;
-// nobody sees the chunk before it is committed. If a chunk with the same
+// go to the storage servers as they are appended, to both tiers when
+// writing through to local FS, and are hashed on the way; nobody sees the
+// chunk before it is committed. Writing through to the object store, commit
+// reads the chunk back and puts it there first. If a chunk with the same
 // bytes exists already, commit returns its id and this copy is dropped.
 // Not thread safe: one append at a time.
 class ChunkWriter {
@@ -159,10 +179,14 @@ class ChunkWriter {
 
   void checkOpen() const;
 
+  // Appends 'bytes' to a copy in a tier of blocks.
+  folly::coro::Task<void> co_appendTo(Replica& replica, folly::ByteRange bytes);
+
   Client& client_;
   const Placement placement_;
   std::unique_ptr<ChunkHasher> hasher_;
-  std::vector<BlockRef> blocks_;
+  // The copies in tiers of blocks, by tier.
+  std::vector<Replica> replicas_;
   uint64_t size_{0};
   // Committed, aborted or failed.
   bool closed_{false};

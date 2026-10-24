@@ -4,8 +4,12 @@
 #include <filesystem>
 #include <map>
 
+#include <sstream>
+
 #include <fmt/format.h>
+#include <folly/FileUtil.h>
 #include <folly/coro/Baton.h>
+#include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
 #include <glog/logging.h>
 
@@ -63,6 +67,38 @@ class RegionStore : public rpc::StorageRpc {
 
 namespace {
 
+// A kept directory's file of region ids: lines of "<file index> <id>".
+constexpr const char* kIdsFile = "region-ids";
+
+std::map<uint32_t, RegionId> readIds(const std::string& dir) {
+  std::map<uint32_t, RegionId> ids;
+  std::string data;
+  if (!folly::readFile((dir + "/" + kIdsFile).c_str(), data)) {
+    return ids;
+  }
+  std::istringstream lines(data);
+  uint32_t index;
+  RegionId id;
+  while (lines >> index >> id) {
+    ids[index] = id;
+  }
+  return ids;
+}
+
+void writeIds(const std::string& dir, const std::vector<RegionInfo>& regions) {
+  std::string data;
+  for (size_t i = 0; i < regions.size(); ++i) {
+    data += fmt::format("{} {}\n", i, regions[i].id);
+  }
+  iovec iov{.iov_base = data.data(), .iov_len = data.size()};
+  if (folly::writeFileAtomicNoThrow(
+          dir + "/" + kIdsFile, &iov, 1, 0644, folly::SyncType::WITH_SYNC) !=
+      0) {
+    LOG(WARNING) << "Cannot write the region ids in " << dir
+                 << "; the regions will not be reattached";
+  }
+}
+
 std::string makeDirectory(const StorageServerOptions& options) {
   std::string parent = options.dir;
   if (parent.empty()) {
@@ -112,21 +148,44 @@ folly::coro::Task<std::unique_ptr<StorageServer>> StorageServer::co_start(
             kBlockSize));
   }
   std::unique_ptr<StorageServer> server(new StorageServer());
-  server->dir_ = makeDirectory(options);
+  server->options_ = options;
+  server->keep_ = options.tier == Tier::kLocalFs && !options.dir.empty();
+  std::map<uint32_t, RegionId> ids;
+  uint32_t count = options.regions;
+  if (server->keep_) {
+    server->dir_ = options.dir;
+    std::error_code error;
+    std::filesystem::create_directories(server->dir_, error);
+    if (error) {
+      throw Error(
+          ErrorCode::kUnavailable,
+          fmt::format("Cannot create {}: {}", server->dir_, error.message()));
+    }
+    ids = readIds(server->dir_);
+    // Keep the regions there are, even beyond options.regions.
+    while (std::filesystem::exists(
+        fmt::format("{}/region-{}", server->dir_, count))) {
+      ++count;
+    }
+  } else {
+    server->dir_ = makeDirectory(options);
+  }
 
   std::vector<std::unique_ptr<Region>> regions;
-  for (uint32_t i = 0; i < options.regions; ++i) {
+  std::vector<RegionInfo> infos;
+  for (uint32_t i = 0; i < count; ++i) {
     regions.push_back(std::make_unique<Region>(
         options.tier,
         fmt::format("{}/region-{}", server->dir_, i),
-        options.regionSize));
-  }
-  std::vector<RegionInfo> infos;
-  for (const auto& region : regions) {
+        options.regionSize,
+        server->keep_));
+    auto id = ids.find(i);
     infos.push_back(RegionInfo{
-        .tier = region->tier(),
-        .length = region->length(),
-        .shm = ShmAccess{.host = localHostName(), .path = region->path()}});
+        .id = id == ids.end() ? 0 : id->second,
+        .tier = regions.back()->tier(),
+        .length = regions.back()->length(),
+        .shm = ShmAccess{
+            .host = localHostName(), .path = regions.back()->path()}});
   }
 
   server->store_ = std::make_shared<RegionStore>(std::move(regions));
@@ -141,12 +200,18 @@ folly::coro::Task<std::unique_ptr<StorageServer>> StorageServer::co_start(
   }
 
   co_await co_waitForMetadata(options.metadata, options.connectTimeout);
-  auto metadata = rpc::connectMetadata(options.metadata);
-  server->regions_ =
-      co_await metadata->co_registerServer(std::move(infos), options.budget);
+  server->metadata_ = rpc::connectMetadata(options.metadata);
+  server->regions_ = co_await server->metadata_->co_registerServer(
+      std::move(infos), options.budget);
+  if (server->keep_) {
+    writeIds(server->dir_, server->regions_);
+  }
   server->store_->registered(server->regions_);
+  server->reregister_ = std::thread([server = server.get()] {
+    server->reregisterLoop();
+  });
   LOG(INFO) << "Storage server " << server->endpoint_.toString() << " serves "
-            << options.regions << " " << toString(options.tier)
+            << count << " " << toString(options.tier)
             << " regions of " << options.regionSize << " bytes in "
             << server->dir_
             << (options.budget == 0
@@ -155,11 +220,47 @@ folly::coro::Task<std::unique_ptr<StorageServer>> StorageServer::co_start(
   co_return server;
 }
 
+void StorageServer::reregisterLoop() {
+  bool failed = false;
+  std::unique_lock lock(mutex_);
+  while (!stop_.wait_for(lock, options_.registerInterval, [&] {
+    return stopping_;
+  })) {
+    lock.unlock();
+    try {
+      // The same ids come back.
+      folly::coro::blockingWait(
+          metadata_->co_registerServer(regions_, options_.budget));
+      if (failed) {
+        LOG(INFO) << "Registered again with " << options_.metadata.toString();
+      }
+      failed = false;
+    } catch (const Error& e) {
+      if (!failed) {
+        LOG(WARNING) << "Cannot register with "
+                     << options_.metadata.toString() << ": " << e.what();
+      }
+      failed = true;
+    }
+    lock.lock();
+  }
+}
+
 StorageServer::~StorageServer() {
+  if (reregister_.joinable()) {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    stop_.notify_all();
+    reregister_.join();
+  }
   rpcServer_.reset();
   store_.reset();
-  std::error_code error;
-  std::filesystem::remove_all(dir_, error);
+  if (!keep_) {
+    std::error_code error;
+    std::filesystem::remove_all(dir_, error);
+  }
 }
 
 } // namespace kiln::server

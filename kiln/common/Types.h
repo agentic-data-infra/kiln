@@ -36,18 +36,31 @@ struct Endpoint {
 // This machine's host name, as other hosts should reach it.
 std::string localHostName();
 
-// Where blocks live. Both tiers are ephemeral: their data is gone when the
-// storage server stops.
+// Where a chunk's bytes live.
 enum class Tier {
-  // Memory, shared through a file in /dev/shm.
+  // Blocks in memory, shared through files in /dev/shm. Gone when the
+  // storage server stops.
   kDram,
-  // A preallocated file on the storage server's local file system.
+  // Blocks in preallocated files on the storage servers' local file
+  // systems. A storage server with its own directory keeps them across
+  // restarts.
   kLocalFs,
+  // Whole chunks as objects in an object store (kiln/objectstore), at
+  // chunkObjectKey(id). Only a write-through target.
+  kObjectStore,
 };
+
+// The tiers of blocks, which storage servers hold.
+constexpr size_t kBlockTiers = 2;
+
+inline bool hasBlocks(Tier tier) {
+  return tier != Tier::kObjectStore;
+}
 
 const char* toString(Tier tier);
 
-// Parses "dram" or "localfs". Throws Error(kInvalidArgument) otherwise.
+// Parses "dram", "localfs" or "objectstore". Throws Error(kInvalidArgument)
+// otherwise.
 Tier parseTier(const std::string& name);
 
 using RegionId = uint64_t;
@@ -101,22 +114,39 @@ struct BlockRef {
   bool operator==(const BlockRef&) const = default;
 };
 
-// Where a new chunk goes.
+// Where a new chunk goes: into 'tier' (DRAM or local FS), and, if set, also
+// into 'writeThrough' before its commit returns. The metadata server
+// journals a written-through chunk's copy in its target tier, so with a
+// local FS or object store target, the chunk outlives restarts.
 struct Placement {
   Tier tier{Tier::kDram};
+  std::optional<Tier> writeThrough;
 
   bool operator==(const Placement&) const = default;
 };
 
-// A committed chunk: its 'size' bytes are the blocks' bytes in order.
+// A copy of a chunk in one tier: its bytes are the blocks' bytes in order,
+// or, in the object store, the object at chunkObjectKey(id).
+struct Replica {
+  Tier tier{Tier::kDram};
+  std::vector<BlockRef> blocks;
+
+  bool operator==(const Replica&) const = default;
+};
+
+// A committed chunk and its copies, fastest tier first. Eviction drops a
+// copy in one tier; the chunk is gone when it has none left.
 struct ChunkInfo {
   ChunkId id;
   uint64_t size{0};
-  std::vector<BlockRef> blocks;
   Placement placement;
+  std::vector<Replica> replicas;
 
   bool operator==(const ChunkInfo&) const = default;
 };
+
+// Where an object store keeps a chunk: "chunks/<id>".
+std::string chunkObjectKey(const ChunkId& id);
 
 // A small named value with a version, kept by the metadata server, e.g. a
 // pointer to the chunk that holds a catalog's latest commit. Updates are

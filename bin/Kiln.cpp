@@ -1,6 +1,8 @@
 // kiln: Kiln's command line client.
 //
-//   kiln [--metadata=host:port] [--tier=dram|localfs] [--tcp_only] put FILE
+//   kiln [--metadata=host:port] [--tier=dram|localfs]
+//        [--write_through=localfs|objectstore] [--object_store=DIR]
+//        [--tcp_only] put FILE
 //   kiln [--metadata=host:port] get ID [FILE]
 //   kiln [--metadata=host:port] stat ID
 //   kiln [--metadata=host:port] rm ID
@@ -25,9 +27,18 @@
 
 #include "kiln/client/Client.h"
 #include "kiln/common/Error.h"
+#include "kiln/objectstore/ObjectStore.h"
 
 DEFINE_string(metadata, "", "The metadata server, host:port.");
 DEFINE_string(tier, "dram", "Where put stores the chunk: dram or localfs.");
+DEFINE_string(
+    write_through,
+    "",
+    "Where put also stores the chunk: localfs or objectstore; none if empty.");
+DEFINE_string(
+    object_store,
+    "",
+    "Directory of the local object store, to write through to and read from.");
 DEFINE_bool(tcp_only, false, "Use TCP even for storage servers on this host.");
 
 namespace kiln {
@@ -40,8 +51,11 @@ folly::coro::Task<void> co_put(client::Client& client, const std::string& path) 
   if (file == nullptr) {
     throw Error(ErrorCode::kInvalidArgument, fmt::format("Cannot open {}", path));
   }
-  auto writer =
-      co_await client.co_create(Placement{.tier = parseTier(FLAGS_tier)});
+  Placement placement{.tier = parseTier(FLAGS_tier)};
+  if (!FLAGS_write_through.empty()) {
+    placement.writeThrough = parseTier(FLAGS_write_through);
+  }
+  auto writer = co_await client.co_create(placement);
   auto buffer = client.allocateBuffer(kPieceSize);
   for (;;) {
     const auto n = std::fread(buffer.data(), 1, buffer.capacity(), file);
@@ -83,18 +97,17 @@ co_get(client::Client& client, ChunkId id, const std::string& path) {
 
 folly::coro::Task<void> co_stat(client::Client& client, ChunkId id) {
   const auto chunk = co_await client.co_stat(id);
-  fmt::print(
-      "id: {}\nsize: {}\ntier: {}\nblocks: {}\n",
-      chunk.id.toString(),
-      chunk.size,
-      toString(chunk.placement.tier),
-      chunk.blocks.size());
-  for (const auto& block : chunk.blocks) {
+  fmt::print("id: {}\nsize: {}\n", chunk.id.toString(), chunk.size);
+  for (const auto& replica : chunk.replicas) {
     fmt::print(
-        "  region {} offset {} length {}\n",
-        block.region,
-        block.offset,
-        block.length);
+        "{}: {} blocks\n", toString(replica.tier), replica.blocks.size());
+    for (const auto& block : replica.blocks) {
+      fmt::print(
+          "  region {} offset {} length {}\n",
+          block.region,
+          block.offset,
+          block.length);
+    }
   }
 }
 
@@ -158,8 +171,12 @@ folly::coro::Task<int> co_main(const std::vector<std::string>& args) {
     const char* env = std::getenv("KILN_METADATA");
     metadata = env != nullptr ? env : "localhost:7470";
   }
-  client::Client client(client::ClientOptions{
-      .metadata = Endpoint::parse(metadata), .useShm = !FLAGS_tcp_only});
+  client::ClientOptions options{
+      .metadata = Endpoint::parse(metadata), .useShm = !FLAGS_tcp_only};
+  if (!FLAGS_object_store.empty()) {
+    options.objectStore = objectstore::makeLocalObjectStore(FLAGS_object_store);
+  }
+  client::Client client(std::move(options));
 
   const auto& command = args[0];
   if (command == "put" && args.size() == 2) {

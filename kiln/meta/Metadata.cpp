@@ -1,8 +1,10 @@
 #include "kiln/meta/Metadata.h"
 
 #include <algorithm>
+#include <set>
 
 #include <fmt/format.h>
+#include <folly/Random.h>
 #include <folly/coro/Sleep.h>
 
 #include "kiln/common/Error.h"
@@ -20,7 +22,18 @@ enum RecordKind : uint8_t {
   // The version of the next ref update, so that versions of removed refs
   // are not reused after the journal is rewritten.
   kNextVersion = 3,
+  // A local-FS region's id, server, tier and length.
+  kRegionSet = 4,
+  // A region's id.
+  kRegionRemoved = 5,
+  // A written-through chunk's id, size and placement, and its copy in the
+  // write-through tier.
+  kChunkSet = 6,
+  // A chunk's id: its copy in the write-through tier is gone.
+  kChunkRemoved = 7,
 };
+
+constexpr uint8_t kNoTier = 0xff;
 
 void checkRefName(const std::string& name) {
   if (name.empty() || name.size() > kMaxRefNameSize) {
@@ -33,32 +46,79 @@ void checkRefName(const std::string& name) {
   }
 }
 
+RecordWriter refRecord(const Ref& ref) {
+  RecordWriter record;
+  record.u8(kRefSet).string(ref.name).string(ref.value).u64(ref.version);
+  return record;
+}
+
+RecordWriter regionRecord(const RegionInfo& region) {
+  RecordWriter record;
+  record.u8(kRegionSet)
+      .u64(region.id)
+      .string(region.server)
+      .u8(static_cast<uint8_t>(region.tier))
+      .u64(region.length);
+  return record;
+}
+
+RecordWriter chunkRecord(const ChunkInfo& chunk, const Replica& replica) {
+  RecordWriter record;
+  record.u8(kChunkSet)
+      .u64(chunk.id.high)
+      .u64(chunk.id.low)
+      .u64(chunk.size)
+      .u8(static_cast<uint8_t>(chunk.placement.tier))
+      .u8(chunk.placement.writeThrough
+              ? static_cast<uint8_t>(*chunk.placement.writeThrough)
+              : kNoTier)
+      .u8(static_cast<uint8_t>(replica.tier))
+      .u64(replica.blocks.size());
+  for (const auto& block : replica.blocks) {
+    record.u64(block.region).u64(block.offset).u64(block.length);
+  }
+  return record;
+}
+
+Tier toTier(uint8_t tier) {
+  if (tier > static_cast<uint8_t>(Tier::kObjectStore)) {
+    throw Error(ErrorCode::kInternal, "Bad tier in journal record");
+  }
+  return static_cast<Tier>(tier);
+}
+
+Tier readTier(RecordReader& reader) {
+  return toTier(reader.u8());
+}
+
+std::optional<Tier> readOptionalTier(RecordReader& reader) {
+  const auto tier = reader.u8();
+  if (tier == kNoTier) {
+    return std::nullopt;
+  }
+  return toTier(tier);
+}
+
+uint64_t blocksOf(const RegionInfo& region) {
+  return region.length / kBlockSize;
+}
+
 } // namespace
 
 Metadata::Metadata(MetadataOptions options) : options_{std::move(options)} {
   if (options_.journal.empty()) {
     return;
   }
-  std::lock_guard lock(refMutex_);
-  journal_ = std::make_unique<Journal>(
-      options_.journal, [&](folly::ByteRange record) { replayLocked(record); });
-  // Keep only the records that make up the current state.
-  std::vector<std::string> records;
-  records.push_back(RecordWriter().u8(kNextVersion).u64(nextVersion_).record());
-  for (const auto& [name, ref] : refs_) {
-    records.push_back(RecordWriter()
-                          .u8(kRefSet)
-                          .string(ref.name)
-                          .string(ref.value)
-                          .u64(ref.version)
-                          .record());
-  }
-  journal_->rewrite(records);
+  // Nothing else runs yet, and append() does nothing until journal_ is set.
+  auto journal = std::make_unique<Journal>(
+      options_.journal, [&](folly::ByteRange record) { replay(record); });
+  journal->rewrite(snapshot());
+  journal_ = std::move(journal);
 }
 
 Metadata::~Metadata() = default;
 
-void Metadata::replayLocked(folly::ByteRange record) {
+void Metadata::replay(folly::ByteRange record) {
   RecordReader reader(record);
   switch (reader.u8()) {
     case kRefSet: {
@@ -75,12 +135,75 @@ void Metadata::replayLocked(folly::ByteRange record) {
     case kNextVersion:
       nextVersion_ = std::max(nextVersion_, reader.u64());
       break;
+    case kRegionSet: {
+      RegionInfo info{.id = reader.u64(), .server = reader.string()};
+      info.tier = readTier(reader);
+      info.length = reader.u64();
+      const auto id = info.id;
+      regions_[id] = Region{.info = std::move(info)};
+      break;
+    }
+    case kRegionRemoved:
+      regions_.erase(reader.u64());
+      break;
+    case kChunkSet: {
+      ChunkInfo info{.id = {.high = reader.u64(), .low = reader.u64()}};
+      info.size = reader.u64();
+      info.placement.tier = readTier(reader);
+      info.placement.writeThrough = readOptionalTier(reader);
+      Replica replica{.tier = readTier(reader)};
+      replica.blocks.resize(reader.u64());
+      for (auto& block : replica.blocks) {
+        block.region = reader.u64();
+        block.offset = reader.u64();
+        block.length = reader.u64();
+      }
+      auto it = chunks_.find(info.id);
+      if (it != chunks_.end()) {
+        eraseChunkLocked(it);
+      }
+      const auto id = info.id;
+      auto& chunk = chunks_.emplace(id, Chunk{.info = std::move(info)})
+                        .first->second;
+      addReplicaLocked(chunk, std::move(replica));
+      break;
+    }
+    case kChunkRemoved: {
+      const ChunkId id{.high = reader.u64(), .low = reader.u64()};
+      auto it = chunks_.find(id);
+      if (it != chunks_.end()) {
+        eraseChunkLocked(it);
+      }
+      break;
+    }
     default:
       throw Error(ErrorCode::kInternal, "Unknown journal record");
   }
 }
 
-void Metadata::appendLocked(const RecordWriter& record) {
+std::vector<std::string> Metadata::snapshot() {
+  std::vector<std::string> records;
+  records.push_back(RecordWriter().u8(kNextVersion).u64(nextVersion_).record());
+  for (const auto& [name, ref] : refs_) {
+    records.push_back(refRecord(ref).record());
+  }
+  for (const auto& [id, region] : regions_) {
+    if (region.info.tier == Tier::kLocalFs) {
+      records.push_back(regionRecord(region.info).record());
+    }
+  }
+  for (const auto& [id, chunk] : chunks_) {
+    for (const auto& replica : chunk.info.replicas) {
+      if (chunk.info.placement.writeThrough == replica.tier) {
+        records.push_back(chunkRecord(chunk.info, replica).record());
+      }
+    }
+  }
+  return records;
+}
+
+void Metadata::append(const RecordWriter& record) {
+  std::lock_guard lock(journalMutex_);
   if (journal_) {
     journal_->append(folly::StringPiece(record.record()));
   }
@@ -93,6 +216,7 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_registerServer(
     throw Error(ErrorCode::kInvalidArgument, "No regions to register");
   }
   uint64_t blocks = 0;
+  std::set<RegionId> kept;
   for (const auto& region : regions) {
     if (region.length < kBlockSize) {
       throw Error(
@@ -100,12 +224,18 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_registerServer(
           fmt::format(
               "Region of {} bytes is smaller than a block", region.length));
     }
-    if (region.server != regions[0].server || region.tier != regions[0].tier) {
+    if (region.server != regions[0].server || region.tier != regions[0].tier ||
+        !hasBlocks(region.tier)) {
       throw Error(
           ErrorCode::kInvalidArgument,
-          "A server registers regions of one server and one tier");
+          "A server registers regions of one server and one tier of blocks");
     }
-    blocks += region.length / kBlockSize;
+    if (region.id != 0 && !kept.insert(region.id).second) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("Region {} is registered twice", region.id));
+    }
+    blocks += blocksOf(region);
   }
   if (budget != 0) {
     if (budget < kBlockSize) {
@@ -117,37 +247,101 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_registerServer(
   }
 
   std::lock_guard lock(mutex_);
-  // Forget the server's old regions and the chunks in them.
+  // This server replaces itself as registered before, and the owners of the
+  // regions it reattaches (e.g. it restarted on another port).
   const auto& name = regions[0].server;
-  std::erase_if(regions_, [&](const auto& entry) {
-    return entry.second.info.server == name;
-  });
-  servers_.erase(name);
-  for (auto it = chunks_.begin(); it != chunks_.end();) {
-    const auto& chunkBlocks = it->second.info.blocks;
-    const bool lost = std::any_of(
-        chunkBlocks.begin(), chunkBlocks.end(), [&](const BlockRef& block) {
-          return !regions_.contains(block.region);
-        });
-    auto next = std::next(it);
-    if (lost) {
-      eraseChunkLocked(it, /*grace=*/true);
+  std::set<std::string> replaced{name};
+  // Reattached regions that were in use until now keep their free lists.
+  std::set<RegionId> live;
+  for (auto id : kept) {
+    auto it = regions_.find(id);
+    if (it != regions_.end()) {
+      replaced.insert(it->second.info.server);
+      if (servers_.contains(it->second.info.server)) {
+        live.insert(id);
+      }
     }
-    it = next;
+  }
+  bool dropped = false;
+  for (auto it = regions_.begin(); it != regions_.end();) {
+    if (replaced.contains(it->second.info.server) &&
+        !kept.contains(it->first)) {
+      if (it->second.info.tier == Tier::kLocalFs) {
+        append(RecordWriter().u8(kRegionRemoved).u64(it->first));
+      }
+      it = regions_.erase(it);
+      dropped = true;
+    } else {
+      ++it;
+    }
+  }
+  if (dropped) {
+    // The copies in the dropped regions are gone.
+    for (auto it = chunks_.begin(); it != chunks_.end();) {
+      std::optional<Tier> lost;
+      for (const auto& replica : it->second.info.replicas) {
+        for (const auto& block : replica.blocks) {
+          if (!regions_.contains(block.region)) {
+            lost = replica.tier;
+          }
+        }
+      }
+      it = lost ? dropReplicaLocked(it, *lost) : std::next(it);
+    }
+  }
+  for (const auto& server : replaced) {
+    servers_.erase(server);
   }
 
-  servers_.emplace(
-      name, Server{.tier = regions[0].tier, .budgetBlocks = blocks});
   for (auto& region : regions) {
-    region.id = nextRegionId_++;
     Region state{.info = region};
-    const auto regionBlocks = region.length / kBlockSize;
-    state.free.reserve(regionBlocks);
-    for (uint64_t i = regionBlocks; i-- > 0;) {
-      state.free.push_back(i * kBlockSize);
+    if (region.id == 0) {
+      do {
+        region.id = folly::Random::rand64();
+      } while (region.id == 0 || regions_.contains(region.id));
+      state.info.id = region.id;
     }
-    regions_.emplace(region.id, std::move(state));
+    if (live.contains(region.id)) {
+      state.free = std::move(regions_.at(region.id).free);
+    } else {
+      // Free unless a chunk's copy (known from the journal) is in it.
+      std::vector<bool> used(blocksOf(region));
+      for (const auto& [id, chunk] : chunks_) {
+        for (const auto& replica : chunk.info.replicas) {
+          for (const auto& block : replica.blocks) {
+            if (block.region == region.id &&
+                block.offset / kBlockSize < used.size()) {
+              used[block.offset / kBlockSize] = true;
+            }
+          }
+        }
+      }
+      for (uint64_t i = used.size(); i-- > 0;) {
+        if (!used[i]) {
+          state.free.push_back(i * kBlockSize);
+        }
+      }
+    }
+    if (region.tier == Tier::kLocalFs) {
+      append(regionRecord(region));
+    }
+    regions_[region.id] = std::move(state);
   }
+
+  Server server{.tier = regions[0].tier, .budgetBlocks = blocks};
+  std::set<RegionId> ids;
+  uint64_t inUse = 0;
+  for (const auto& region : regions) {
+    ids.insert(region.id);
+    inUse += blocksOf(region) - regions_.at(region.id).free.size();
+  }
+  for (const auto& entry : grace_) {
+    if (ids.contains(entry.block.region)) {
+      ++server.graceBlocks;
+    }
+  }
+  server.liveBlocks = inUse - server.graceBlocks;
+  servers_[name] = server;
   co_return regions;
 }
 
@@ -167,8 +361,13 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_getRegions(
 }
 
 folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
-    Placement placement,
+    Tier tier,
     uint32_t count) {
+  if (!hasBlocks(tier)) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format("The {} tier has no blocks", toString(tier)));
+  }
   // Blocks freed before this call are reusable by the end of their grace
   // period; waiting longer would not help.
   const auto deadline =
@@ -177,7 +376,7 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
     Clock::duration wait;
     {
       std::lock_guard lock(mutex_);
-      if (auto blocks = tryAllocateLocked(placement, count, wait)) {
+      if (auto blocks = tryAllocateLocked(tier, count, wait)) {
         co_return std::move(*blocks);
       }
     }
@@ -187,7 +386,7 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
           fmt::format(
               "No {} blocks in {} became free in time",
               count,
-              toString(placement.tier)));
+              toString(tier)));
     }
     co_await folly::coro::sleep(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -197,7 +396,7 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
 }
 
 std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
-    Placement placement,
+    Tier tier,
     uint32_t count,
     Clock::duration& wait) {
   const auto now = Clock::now();
@@ -206,24 +405,26 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
   auto tierBlocks = [&](auto blocksOf) {
     uint64_t sum = 0;
     for (const auto& [name, server] : servers_) {
-      if (server.tier == placement.tier) {
+      if (server.tier == tier) {
         sum += blocksOf(server);
       }
     }
     return sum;
   };
-  const auto budget = tierBlocks([](const Server& s) { return s.budgetBlocks; });
+  // Free now or after the grace period. A server may be over its budget if
+  // it registered again with a smaller one.
   auto available = [&] {
-    // Free now or after the grace period.
-    return budget - tierBlocks([](const Server& s) { return s.liveBlocks; });
+    return tierBlocks([](const Server& s) {
+      return s.budgetBlocks - std::min(s.budgetBlocks, s.liveBlocks);
+    });
   };
+  const auto budget = tierBlocks([](const Server& s) { return s.budgetBlocks; });
 
   // Keep some of the tier free, so that allocations rarely wait for the
   // grace period of the blocks they need.
   if (available() < count + options_.evictBelow * budget) {
     evictLocked(
-        placement.tier,
-        std::min<uint64_t>(budget, count + options_.evictUntil * budget));
+        tier, std::min<uint64_t>(budget, count + options_.evictUntil * budget));
   }
   if (available() < count) {
     throw Error(
@@ -231,19 +432,20 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
         fmt::format(
             "Asked for {} blocks in {}: {} of {} are in chunks being written",
             count,
-            toString(placement.tier),
+            toString(tier),
             budget - available(),
             budget));
   }
   const auto freeNow = tierBlocks([](const Server& s) {
-    return s.budgetBlocks - s.liveBlocks - s.graceBlocks;
+    return s.budgetBlocks -
+        std::min(s.budgetBlocks, s.liveBlocks + s.graceBlocks);
   });
   if (freeNow < count) {
     // Wait until the oldest freed block of the tier is reusable.
     wait = options_.gracePeriod;
     for (const auto& entry : grace_) {
       auto* server = serverOf(entry.block.region);
-      if (server != nullptr && server->tier == placement.tier) {
+      if (server != nullptr && server->tier == tier) {
         wait = entry.reusableAt - now;
         break;
       }
@@ -256,7 +458,7 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
   std::vector<std::pair<Region*, Server*>> candidates;
   auto consider = [&](Region& region) {
     auto* server = serverOf(region.info.id);
-    if (region.info.tier == placement.tier && server != nullptr) {
+    if (region.info.tier == tier && server != nullptr) {
       candidates.emplace_back(&region, server);
     }
   };
@@ -291,24 +493,30 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
 
 void Metadata::evictLocked(Tier tier, uint64_t available) {
   auto& lru = lruOf(tier);
-  auto live = [&] {
+  auto free = [&] {
     uint64_t sum = 0;
     for (const auto& [name, server] : servers_) {
       if (server.tier == tier) {
-        sum += server.liveBlocks;
+        sum += server.budgetBlocks -
+            std::min(server.budgetBlocks, server.liveBlocks);
       }
     }
     return sum;
   };
-  uint64_t budget = 0;
-  for (const auto& [name, server] : servers_) {
-    if (server.tier == tier) {
-      budget += server.budgetBlocks;
+  for (auto it = lru.begin(); it != lru.end() && free() < available;) {
+    auto chunk = chunks_.find(*it);
+    ++it;
+    const auto& replicas = chunk->second.info.replicas;
+    auto replica = std::find_if(
+        replicas.begin(), replicas.end(), [&](const Replica& r) {
+          return r.tier == tier;
+        });
+    // Dropping copies on servers that have not registered (again) frees
+    // nothing here.
+    if (readableLocked(*replica)) {
+      dropReplicaLocked(chunk, tier);
+      ++evictions_;
     }
-  }
-  while (!lru.empty() && budget - live() < available) {
-    eraseChunkLocked(chunks_.find(lru.front()), /*grace=*/true);
-    ++evictions_;
   }
 }
 
@@ -335,6 +543,17 @@ Metadata::Server* Metadata::serverOf(RegionId region) {
   return server == servers_.end() ? nullptr : &server->second;
 }
 
+bool Metadata::readableLocked(const Replica& replica) const {
+  for (const auto& block : replica.blocks) {
+    auto region = regions_.find(block.region);
+    if (region == regions_.end() ||
+        !servers_.contains(region->second.info.server)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 folly::coro::Task<void> Metadata::co_free(std::vector<BlockRef> blocks) {
   std::lock_guard lock(mutex_);
   freeLocked(blocks, /*grace=*/false);
@@ -358,54 +577,161 @@ void Metadata::freeLocked(const std::vector<BlockRef>& blocks, bool grace) {
   }
 }
 
-void Metadata::eraseChunkLocked(
-    std::unordered_map<ChunkId, Chunk>::iterator chunk,
-    bool grace) {
-  lruOf(chunk->second.info.placement.tier).erase(chunk->second.lru);
-  freeLocked(chunk->second.info.blocks, grace);
-  chunks_.erase(chunk);
+void Metadata::addReplicaLocked(Chunk& chunk, Replica replica) {
+  if (hasBlocks(replica.tier)) {
+    auto& lru = lruOf(replica.tier);
+    lru.push_back(chunk.info.id);
+    chunk.lru[static_cast<size_t>(replica.tier)] = std::prev(lru.end());
+  }
+  if (chunk.info.placement.writeThrough == replica.tier) {
+    append(chunkRecord(chunk.info, replica));
+  }
+  auto& replicas = chunk.info.replicas;
+  replicas.push_back(std::move(replica));
+  std::sort(replicas.begin(), replicas.end(), [](const auto& a, const auto& b) {
+    return a.tier < b.tier;
+  });
+}
+
+Metadata::ChunkMap::iterator Metadata::dropReplicaLocked(
+    ChunkMap::iterator chunk,
+    Tier tier) {
+  auto& info = chunk->second.info;
+  auto replica = std::find_if(
+      info.replicas.begin(), info.replicas.end(), [&](const Replica& r) {
+        return r.tier == tier;
+      });
+  if (replica == info.replicas.end()) {
+    return std::next(chunk);
+  }
+  if (hasBlocks(tier)) {
+    lruOf(tier).erase(chunk->second.lru[static_cast<size_t>(tier)]);
+    freeLocked(replica->blocks, /*grace=*/true);
+  }
+  if (info.placement.writeThrough == tier) {
+    append(RecordWriter().u8(kChunkRemoved).u64(info.id.high).u64(info.id.low));
+  }
+  info.replicas.erase(replica);
+  if (info.replicas.empty()) {
+    return chunks_.erase(chunk);
+  }
+  return std::next(chunk);
+}
+
+void Metadata::eraseChunkLocked(ChunkMap::iterator chunk) {
+  std::vector<Tier> tiers;
+  for (const auto& replica : chunk->second.info.replicas) {
+    tiers.push_back(replica.tier);
+  }
+  // The last drop erases the chunk.
+  for (auto tier : tiers) {
+    dropReplicaLocked(chunk, tier);
+  }
 }
 
 folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
   std::lock_guard lock(mutex_);
-  uint64_t size = 0;
-  for (const auto& block : chunk.blocks) {
-    auto it = regions_.find(block.region);
-    if (it == regions_.end() || block.offset % kBlockSize != 0 ||
-        block.length > kBlockSize ||
-        block.offset + kBlockSize > it->second.info.length ||
-        it->second.info.tier != chunk.placement.tier) {
-      throw Error(
-          ErrorCode::kInvalidArgument,
-          fmt::format(
-              "Bad block region {} offset {} length {}",
-              block.region,
-              block.offset,
-              block.length));
-    }
-    size += block.length;
-  }
-  if (size != chunk.size) {
+  const auto& placement = chunk.placement;
+  if (!hasBlocks(placement.tier) || placement.writeThrough == placement.tier) {
     throw Error(
         ErrorCode::kInvalidArgument,
         fmt::format(
-            "Chunk of {} bytes has {} bytes of blocks", chunk.size, size));
+            "Bad placement in {} writing through to {}",
+            toString(placement.tier),
+            placement.writeThrough ? toString(*placement.writeThrough)
+                                   : "nothing"));
+  }
+  std::vector<Tier> tiers{placement.tier};
+  if (placement.writeThrough) {
+    tiers.push_back(*placement.writeThrough);
+  }
+  std::sort(tiers.begin(), tiers.end());
+  if (chunk.replicas.size() != tiers.size()) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format(
+            "Chunk with {} copies for {} tiers",
+            chunk.replicas.size(),
+            tiers.size()));
+  }
+  for (size_t i = 0; i < tiers.size(); ++i) {
+    const auto& replica = chunk.replicas[i];
+    if (replica.tier != tiers[i]) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("Copy in {} out of place", toString(replica.tier)));
+    }
+    if (!hasBlocks(replica.tier)) {
+      if (!replica.blocks.empty()) {
+        throw Error(
+            ErrorCode::kInvalidArgument,
+            fmt::format("Copy in {} with blocks", toString(replica.tier)));
+      }
+      continue;
+    }
+    uint64_t size = 0;
+    for (const auto& block : replica.blocks) {
+      auto it = regions_.find(block.region);
+      if (it == regions_.end() || block.offset % kBlockSize != 0 ||
+          block.length > kBlockSize ||
+          block.offset + kBlockSize > it->second.info.length ||
+          it->second.info.tier != replica.tier) {
+        throw Error(
+            ErrorCode::kInvalidArgument,
+            fmt::format(
+                "Bad block region {} offset {} length {}",
+                block.region,
+                block.offset,
+                block.length));
+      }
+      size += block.length;
+    }
+    if (size != chunk.size) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format(
+              "Chunk of {} bytes has {} bytes of blocks in {}",
+              chunk.size,
+              size,
+              toString(replica.tier)));
+    }
   }
 
   auto it = chunks_.find(chunk.id);
-  if (it != chunks_.end()) {
-    // The first commit wins; the same bytes are stored already. Nobody has
-    // seen this copy's blocks.
-    freeLocked(chunk.blocks, /*grace=*/false);
+  if (it == chunks_.end()) {
+    const auto id = chunk.id;
+    auto replicas = std::move(chunk.replicas);
+    chunk.replicas.clear();
+    it = chunks_.emplace(id, Chunk{.info = std::move(chunk)}).first;
+    for (auto& replica : replicas) {
+      addReplicaLocked(it->second, std::move(replica));
+    }
     co_return it->second.info;
   }
-  auto& lru = lruOf(chunk.placement.tier);
-  lru.push_back(chunk.id);
-  const auto id = chunk.id;
-  it = chunks_
-           .emplace(id, Chunk{.info = std::move(chunk), .lru = std::prev(lru.end())})
-           .first;
-  co_return it->second.info;
+  // The first commit wins; the same bytes are stored already. Copies in
+  // tiers it has none in are added, the others dropped: nobody has seen
+  // their blocks.
+  auto& existing = it->second;
+  for (auto& replica : chunk.replicas) {
+    const bool present = std::any_of(
+        existing.info.replicas.begin(),
+        existing.info.replicas.end(),
+        [&](const Replica& r) { return r.tier == replica.tier; });
+    if (present) {
+      freeLocked(replica.blocks, /*grace=*/false);
+      continue;
+    }
+    if (!existing.info.placement.writeThrough &&
+        placement.writeThrough == replica.tier) {
+      existing.info.placement.writeThrough = replica.tier;
+    }
+    addReplicaLocked(existing, std::move(replica));
+  }
+  ChunkInfo result = existing.info;
+  std::erase_if(result.replicas, [&](const Replica& r) {
+    return !readableLocked(r);
+  });
+  co_return result;
 }
 
 folly::coro::Task<ChunkInfo> Metadata::co_lookup(ChunkId id) {
@@ -415,9 +741,25 @@ folly::coro::Task<ChunkInfo> Metadata::co_lookup(ChunkId id) {
     throw Error(
         ErrorCode::kNotFound, fmt::format("No chunk {}", id.toString()));
   }
-  auto& lru = lruOf(it->second.info.placement.tier);
-  lru.splice(lru.end(), lru, it->second.lru);
-  co_return it->second.info;
+  ChunkInfo result = it->second.info;
+  std::erase_if(result.replicas, [&](const Replica& r) {
+    return !readableLocked(r);
+  });
+  if (result.replicas.empty()) {
+    throw Error(
+        ErrorCode::kUnavailable,
+        fmt::format(
+            "The storage servers of chunk {} have not registered",
+            id.toString()));
+  }
+  for (const auto& replica : result.replicas) {
+    if (hasBlocks(replica.tier)) {
+      auto& lru = lruOf(replica.tier);
+      lru.splice(
+          lru.end(), lru, it->second.lru[static_cast<size_t>(replica.tier)]);
+    }
+  }
+  co_return result;
 }
 
 folly::coro::Task<bool> Metadata::co_remove(ChunkId id) {
@@ -426,7 +768,7 @@ folly::coro::Task<bool> Metadata::co_remove(ChunkId id) {
   if (it == chunks_.end()) {
     co_return false;
   }
-  eraseChunkLocked(it, /*grace=*/true);
+  eraseChunkLocked(it);
   co_return true;
 }
 
@@ -461,7 +803,7 @@ folly::coro::Task<std::optional<Ref>> Metadata::co_casRef(
     co_return std::nullopt;
   }
   Ref ref{.name = name, .value = std::move(value), .version = nextVersion_};
-  appendLocked(RecordWriter()
+  append(RecordWriter()
                    .u8(kRefSet)
                    .string(ref.name)
                    .string(ref.value)
@@ -491,7 +833,7 @@ folly::coro::Task<bool> Metadata::co_removeRef(
       (expectedVersion && it->second.version != *expectedVersion)) {
     co_return false;
   }
-  appendLocked(RecordWriter().u8(kRefRemoved).string(name));
+  append(RecordWriter().u8(kRefRemoved).string(name));
   refs_.erase(it);
   co_return true;
 }
@@ -501,12 +843,12 @@ size_t Metadata::freeBlocks(Tier tier) const {
   size_t count = 0;
   for (const auto& [name, server] : servers_) {
     if (server.tier == tier) {
-      count += server.budgetBlocks - server.liveBlocks;
+      count += server.budgetBlocks -
+          std::min(server.budgetBlocks, server.liveBlocks);
     }
   }
-  return count - graceBlocksLocked(tier);
+  return count - std::min(count, graceBlocksLocked(tier));
 }
-
 size_t Metadata::graceBlocks(Tier tier) const {
   std::lock_guard lock(mutex_);
   return graceBlocksLocked(tier);

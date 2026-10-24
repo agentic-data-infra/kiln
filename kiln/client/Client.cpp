@@ -7,6 +7,7 @@
 
 #include "kiln/client/Transport.h"
 #include "kiln/common/Error.h"
+#include "kiln/objectstore/ObjectStore.h"
 #include "kiln/rpc/Rpc.h"
 
 namespace kiln::client {
@@ -36,6 +37,16 @@ Buffer Client::registerMemory(void* data, size_t length) {
 
 folly::coro::Task<std::unique_ptr<ChunkWriter>> Client::co_create(
     Placement placement) {
+  if (!hasBlocks(placement.tier) || placement.writeThrough == placement.tier) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format("Cannot place a chunk in {}", toString(placement.tier)));
+  }
+  if (placement.writeThrough == Tier::kObjectStore && !options_.objectStore) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        "Writing through to the object store needs one in ClientOptions");
+  }
   co_return std::unique_ptr<ChunkWriter>(new ChunkWriter(*this, placement));
 }
 
@@ -58,13 +69,54 @@ Client::co_read(ChunkId id, uint64_t offset, uint64_t length, Buffer&& dst) {
         fmt::format(
             "Buffer of {} bytes cannot hold {}", dst.capacity(), length));
   }
-  const auto regions = co_await co_regions(chunk.blocks);
+  // The fastest copy that can be reached.
+  std::optional<Error> error;
+  for (const auto& replica : chunk.replicas) {
+    if (!hasBlocks(replica.tier) && !options_.objectStore) {
+      continue;
+    }
+    try {
+      co_await co_readReplica(id, replica, offset, length, dst.data());
+      dst.setSize(length);
+      co_return std::move(dst);
+    } catch (const Error& e) {
+      if (e.code() != ErrorCode::kUnavailable) {
+        throw;
+      }
+      error = e;
+    }
+  }
+  throw error ? *error
+              : Error(
+                    ErrorCode::kUnavailable,
+                    fmt::format(
+                        "No copy of chunk {} can be reached", id.toString()));
+}
+
+folly::coro::Task<void> Client::co_readReplica(
+    ChunkId id,
+    const Replica& replica,
+    uint64_t offset,
+    uint64_t length,
+    uint8_t* dst) {
+  if (!hasBlocks(replica.tier)) {
+    const auto n = co_await options_.objectStore->co_get(
+        chunkObjectKey(id), offset, folly::MutableByteRange(dst, length));
+    if (n != length) {
+      throw Error(
+          ErrorCode::kInternal,
+          fmt::format(
+              "Object of chunk {} is shorter than the chunk", id.toString()));
+    }
+    co_return;
+  }
+  const auto regions = co_await co_regions(replica.blocks);
 
   // The blocks' parts in [offset, offset + length), read at once.
   std::vector<folly::coro::Task<void>> reads;
   uint64_t blockStart = 0;
-  for (size_t i = 0; i < chunk.blocks.size(); ++i) {
-    const auto& block = chunk.blocks[i];
+  for (size_t i = 0; i < replica.blocks.size(); ++i) {
+    const auto& block = replica.blocks[i];
     const auto begin = std::max(offset, blockStart);
     const auto end = std::min(offset + length, blockStart + block.length);
     if (begin < end) {
@@ -73,13 +125,11 @@ Client::co_read(ChunkId id, uint64_t offset, uint64_t length, Buffer&& dst) {
                               regions[i],
                               block.offset + (begin - blockStart),
                               folly::MutableByteRange(
-                                  dst.data() + (begin - offset), end - begin)));
+                                  dst + (begin - offset), end - begin)));
     }
     blockStart += block.length;
   }
   co_await folly::coro::collectAllRange(std::move(reads));
-  dst.setSize(length);
-  co_return std::move(dst);
 }
 
 folly::coro::Task<ChunkInfo> Client::co_stat(ChunkId id) {
@@ -183,7 +233,16 @@ void Client::cacheChunk(const ChunkInfo& chunk) {
 ChunkWriter::ChunkWriter(Client& client, Placement placement)
     : client_{client},
       placement_{placement},
-      hasher_{std::make_unique<ChunkHasher>()} {}
+      hasher_{std::make_unique<ChunkHasher>()} {
+  replicas_.push_back(Replica{.tier = placement.tier});
+  if (placement.writeThrough && hasBlocks(*placement.writeThrough)) {
+    replicas_.push_back(Replica{.tier = *placement.writeThrough});
+  }
+  std::sort(
+      replicas_.begin(), replicas_.end(), [](const auto& a, const auto& b) {
+        return a.tier < b.tier;
+      });
+}
 
 ChunkWriter::~ChunkWriter() = default;
 
@@ -203,28 +262,42 @@ folly::coro::Task<Buffer> ChunkWriter::co_append(Buffer&& data) {
   }
   // A failed append leaves the chunk incomplete; only co_abort is left.
   closed_ = true;
+  std::vector<folly::coro::Task<void>> appends;
+  for (auto& replica : replicas_) {
+    appends.push_back(co_appendTo(replica, bytes));
+  }
+  co_await folly::coro::collectAllRange(std::move(appends));
+  hasher_->update(bytes);
+  size_ += bytes.size();
+  closed_ = false;
+  co_return std::move(data);
+}
 
+folly::coro::Task<void> ChunkWriter::co_appendTo(
+    Replica& replica,
+    folly::ByteRange bytes) {
+  auto& blocks = replica.blocks;
   // Fill the last block, then new ones.
-  const uint64_t room =
-      blocks_.empty() ? 0 : kBlockSize - blocks_.back().length;
-  const size_t first = room > 0 ? blocks_.size() - 1 : blocks_.size();
+  const uint64_t room = blocks.empty() ? 0 : kBlockSize - blocks.back().length;
+  const size_t first = room > 0 ? blocks.size() - 1 : blocks.size();
   if (bytes.size() > room) {
     const auto count = (bytes.size() - room + kBlockSize - 1) / kBlockSize;
-    auto blocks = co_await client_.metadata_->co_allocate(
-        placement_, static_cast<uint32_t>(count));
-    for (auto& block : blocks) {
+    auto allocated = co_await client_.metadata_->co_allocate(
+        replica.tier, static_cast<uint32_t>(count));
+    for (auto& block : allocated) {
       block.length = 0;
-      blocks_.push_back(block);
+      blocks.push_back(block);
     }
   }
-  std::vector<BlockRef> touched(blocks_.begin() + first, blocks_.end());
+  std::vector<BlockRef> touched(blocks.begin() + first, blocks.end());
   const auto regions = co_await client_.co_regions(touched);
 
   std::vector<folly::coro::Task<void>> writes;
   size_t done = 0;
   for (size_t i = first; done < bytes.size(); ++i) {
-    auto& block = blocks_[i];
-    const auto n = std::min<uint64_t>(kBlockSize - block.length, bytes.size() - done);
+    auto& block = blocks[i];
+    const auto n =
+        std::min<uint64_t>(kBlockSize - block.length, bytes.size() - done);
     const auto& region = regions[i - first];
     writes.push_back(client_.transportFor(region).co_write(
         region, block.offset + block.length, bytes.subpiece(done, n)));
@@ -232,22 +305,29 @@ folly::coro::Task<Buffer> ChunkWriter::co_append(Buffer&& data) {
     done += n;
   }
   co_await folly::coro::collectAllRange(std::move(writes));
-  hasher_->update(bytes);
-  size_ += bytes.size();
-  closed_ = false;
-  co_return std::move(data);
 }
 
 folly::coro::Task<ChunkId> ChunkWriter::co_commit() {
   checkOpen();
   closed_ = true;
+  const auto id = hasher_->id();
+  auto replicas = replicas_;
+  if (placement_.writeThrough == Tier::kObjectStore) {
+    // The object store takes whole objects: read the chunk back.
+    auto data = Buffer::allocate(std::max<uint64_t>(size_, 1));
+    co_await client_.co_readReplica(id, replicas_[0], 0, size_, data.data());
+    co_await client_.options_.objectStore->co_put(
+        chunkObjectKey(id), folly::ByteRange(data.data(), size_));
+    Replica object{.tier = Tier::kObjectStore};
+    replicas.push_back(std::move(object));
+  }
   // A named argument: GCC 12 destroys temporaries in a co_await's
   // arguments twice.
   ChunkInfo committing{
-      .id = hasher_->id(),
+      .id = id,
       .size = size_,
-      .blocks = blocks_,
-      .placement = placement_};
+      .placement = placement_,
+      .replicas = std::move(replicas)};
   auto chunk = co_await client_.metadata_->co_commit(std::move(committing));
   client_.cacheChunk(chunk);
   co_return chunk.id;
@@ -255,8 +335,11 @@ folly::coro::Task<ChunkId> ChunkWriter::co_commit() {
 
 folly::coro::Task<void> ChunkWriter::co_abort() {
   closed_ = true;
-  auto blocks = std::move(blocks_);
-  blocks_.clear();
+  std::vector<BlockRef> blocks;
+  for (auto& replica : replicas_) {
+    blocks.insert(blocks.end(), replica.blocks.begin(), replica.blocks.end());
+    replica.blocks.clear();
+  }
   if (!blocks.empty()) {
     co_await client_.metadata_->co_free(std::move(blocks));
   }

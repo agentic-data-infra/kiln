@@ -1,9 +1,12 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <folly/coro/Task.h>
@@ -11,6 +14,7 @@
 #include "kiln/common/Types.h"
 
 namespace kiln::rpc {
+class MetadataRpc;
 class RpcServer;
 }
 
@@ -33,24 +37,31 @@ struct StorageServerOptions {
   uint64_t regionSize{kRegionSize};
   // Bytes of the regions the metadata server may hand out; 0 for all.
   uint64_t budget{0};
-  // Where this server's directory of region files goes; empty for /dev/shm
-  // (DRAM) or $TMPDIR, else /tmp (local FS).
+  // DRAM: where this server's new directory of region files goes; empty for
+  // /dev/shm. Local FS: this server's own directory, created if missing,
+  // whose region files stay when the server stops and are reattached with
+  // their data when it starts again; empty for a new directory in $TMPDIR,
+  // else /tmp, that goes when it stops.
   std::string dir;
   // How long to keep trying to reach the metadata server.
   std::chrono::milliseconds connectTimeout{std::chrono::seconds(60)};
+  // How often to register again, so that a restarted metadata server learns
+  // of the regions.
+  std::chrono::milliseconds registerInterval{std::chrono::seconds(5)};
 };
 
 // A storage server: holds the blocks of one tier in its regions and serves
 // reads and writes of them. It knows nothing of chunks; the metadata server
-// hands out its blocks. Its data is gone when it stops.
+// hands out its blocks. A DRAM server's data is gone when it stops; a
+// local-FS server with its own directory keeps it.
 class StorageServer {
  public:
-  // Creates the regions in a new directory, serves them and registers them
+  // Creates (or reattaches) the regions, serves them and registers them
   // with the metadata server. Fails with kiln::Error.
   static folly::coro::Task<std::unique_ptr<StorageServer>> co_start(
       StorageServerOptions options);
 
-  // Stops serving and removes the regions.
+  // Stops serving and removes the regions, unless kept.
   ~StorageServer();
 
   // This server's endpoint, as clients reach it.
@@ -66,7 +77,18 @@ class StorageServer {
  private:
   StorageServer() = default;
 
+  // Registers again every registerInterval until stopped.
+  void reregisterLoop();
+
+  StorageServerOptions options_;
   std::string dir_;
+  // Whether dir_ and the region files stay.
+  bool keep_{false};
+  std::shared_ptr<rpc::MetadataRpc> metadata_;
+  std::thread reregister_;
+  std::mutex mutex_;
+  std::condition_variable stop_;
+  bool stopping_{false};
   std::shared_ptr<RegionStore> store_;
   std::unique_ptr<rpc::RpcServer> rpcServer_;
   Endpoint endpoint_;
