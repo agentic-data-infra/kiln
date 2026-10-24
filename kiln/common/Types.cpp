@@ -53,6 +53,8 @@ const char* toString(Tier tier) {
       return "dram";
     case Tier::kLocalFs:
       return "localfs";
+    case Tier::kObjectStore:
+      return "objectstore";
   }
   return "unknown";
 }
@@ -64,9 +66,17 @@ Tier parseTier(const std::string& name) {
   if (name == "localfs") {
     return Tier::kLocalFs;
   }
+  if (name == "objectstore") {
+    return Tier::kObjectStore;
+  }
   throw Error(
       ErrorCode::kInvalidArgument,
-      fmt::format("Unknown tier '{}', expected dram or localfs", name));
+      fmt::format(
+          "Unknown tier '{}', expected dram, localfs or objectstore", name));
+}
+
+std::string chunkObjectKey(const ChunkId& id) {
+  return "chunks/" + id.toString();
 }
 
 } // namespace kiln

@@ -28,21 +28,26 @@ class MetadataRpc {
   virtual folly::coro::Task<std::vector<RegionInfo>> co_getRegions(
       std::vector<RegionId> ids) = 0;
 
-  // 'count' free blocks of length kBlockSize in the placement's tier. Evicts
-  // the tier's least recently used chunks to make room; fails with
-  // kOutOfSpace if that cannot make enough.
+  // 'count' free blocks of length kBlockSize in a tier of blocks. Evicts
+  // the tier's least recently used copies of chunks to make room; fails
+  // with kOutOfSpace if that cannot make enough.
   virtual folly::coro::Task<std::vector<BlockRef>> co_allocate(
-      Placement placement,
+      Tier tier,
       uint32_t count) = 0;
 
   // Returns blocks from co_allocate that no chunk uses.
   virtual folly::coro::Task<void> co_free(std::vector<BlockRef> blocks) = 0;
 
-  // Makes a chunk visible. The first commit of an id wins: a later one gets
-  // the first one's chunk back, and its own blocks are freed.
+  // Makes a chunk visible. Its replicas are its copies in the placement's
+  // tier and write-through tier, in that order. The first commit of an id
+  // wins: a later one gets the first one's chunk back, with its own copies
+  // added in tiers where that one has none (e.g. evicted ones), and the
+  // blocks of its other copies freed.
   virtual folly::coro::Task<ChunkInfo> co_commit(ChunkInfo chunk) = 0;
 
-  // Fails with kNotFound if there is no such chunk, e.g. it was evicted.
+  // The chunk with the copies that can be read now. Fails with kNotFound
+  // if there is no such chunk, e.g. it was evicted, and kUnavailable if
+  // none of its copies' storage servers has registered (after a restart).
   virtual folly::coro::Task<ChunkInfo> co_lookup(ChunkId id) = 0;
 
   // Returns whether the chunk existed. Its blocks are freed after the grace

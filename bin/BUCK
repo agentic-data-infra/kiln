@@ -32,7 +32,10 @@ cxx_binary(
 cxx_binary(
     name = "kiln",
     srcs = ["Kiln.cpp"],
-    deps = ["//kiln/client:client"],
+    deps = [
+        "//kiln/client:client",
+        "//kiln/objectstore:objectstore",
+    ],
     link_ordering = "topological",
     visibility = ["PUBLIC"],
 )

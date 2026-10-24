@@ -28,24 +28,30 @@ struct MetadataOptions {
   // that later allocations find blocks whose grace period is over.
   double evictBelow{0.1};
   double evictUntil{0.2};
-  // The file that keeps refs across restarts; none if empty, and then refs
-  // are gone when the metadata server stops.
+  // The file that keeps refs, local-FS regions and written-through chunks
+  // across restarts; none if empty, and then all is gone when the metadata
+  // server stops.
   std::string journal;
 };
 
 // The metadata server's state, in memory: the storage servers' regions and
-// budgets, the free blocks in the regions, and the blocks of every committed
-// chunk. Storage servers never hear about chunks; they only hold the bytes.
+// budgets, the free blocks in the regions, the copies (replicas) of every
+// committed chunk, and refs. Storage servers never hear about chunks; they
+// only hold the bytes.
 //
 // Blocks are allocated round robin over the tier's regions, so a chunk's
 // blocks spread over the storage servers; a server hands out at most its
-// budget. When a tier is full, allocate evicts its least recently committed
-// or looked up chunks: they are gone (lookups fail with kNotFound), and
-// their blocks are reused after the grace period. If only blocks in their
-// grace period could satisfy an allocation, it waits for them.
+// budget. When a tier is full, allocate evicts the copies there of its least
+// recently committed or looked up chunks; a chunk without copies is gone
+// (lookups fail with kNotFound). Blocks of dropped copies are reused after
+// the grace period. If only blocks in their grace period could satisfy an
+// allocation, it waits for them.
 //
-// Refs are kept apart from the blocks, and with a journal every update is
-// on disk before the call returns.
+// With a journal, refs, local-FS regions and the copies of written-through
+// chunks in their target tier are on disk before the call that changes them
+// returns, and a restarted metadata server has them back. Copies in regions
+// whose storage server has not registered again cannot be read until it
+// does.
 class Metadata : public rpc::MetadataRpc {
  public:
   // Replays the journal, if any.
@@ -53,9 +59,11 @@ class Metadata : public rpc::MetadataRpc {
 
   ~Metadata() override;
 
-  // A storage server that registers again (e.g. after a restart) replaces
-  // its old regions; chunks with blocks in them are gone, as the tiers are
-  // ephemeral. All of a server's regions must be in one tier.
+  // A server's regions come with ids if the server had them registered
+  // before (it registers again periodically, and after restarts): the
+  // regions it no longer has are dropped with the copies in them, those it
+  // reattaches keep their copies, and new regions (id 0) get new ids. All
+  // of a server's regions must be in one tier.
   folly::coro::Task<std::vector<RegionInfo>> co_registerServer(
       std::vector<RegionInfo> regions,
       uint64_t budget) override;
@@ -64,7 +72,7 @@ class Metadata : public rpc::MetadataRpc {
       std::vector<RegionId> ids) override;
 
   folly::coro::Task<std::vector<BlockRef>> co_allocate(
-      Placement placement,
+      Tier tier,
       uint32_t count) override;
 
   // Blocks that no reader has seen are reusable at once.
@@ -74,6 +82,8 @@ class Metadata : public rpc::MetadataRpc {
 
   folly::coro::Task<ChunkInfo> co_lookup(ChunkId id) override;
 
+  // Objects of the chunk in an object store stay; the metadata server does
+  // not reach object stores.
   folly::coro::Task<bool> co_remove(ChunkId id) override;
 
   folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override;
@@ -96,7 +106,7 @@ class Metadata : public rpc::MetadataRpc {
 
   size_t chunkCount() const;
 
-  // Chunks evicted so far.
+  // Copies evicted so far.
   size_t evictions() const;
 
  private:
@@ -111,17 +121,24 @@ class Metadata : public rpc::MetadataRpc {
     uint64_t graceBlocks{0};
   };
 
+  // A region known from a registration or the journal. Blocks are allocated
+  // only in regions of registered servers (in servers_).
   struct Region {
     RegionInfo info;
     // Offsets of free blocks; the last one is handed out first.
     std::vector<uint64_t> free;
   };
 
+  using LruList = std::list<ChunkId>;
+
   struct Chunk {
     ChunkInfo info;
-    // The chunk's place in its tier's LRU list.
-    std::list<ChunkId>::iterator lru;
+    // The chunk's place in the LRU list of each tier of blocks it has a
+    // copy in.
+    LruList::iterator lru[kBlockTiers];
   };
+
+  using ChunkMap = std::unordered_map<ChunkId, Chunk>;
 
   struct GraceBlock {
     BlockRef block;
@@ -131,14 +148,12 @@ class Metadata : public rpc::MetadataRpc {
   // Tries to allocate under the lock. Returns the blocks, or how long to
   // wait for blocks in their grace period; throws kOutOfSpace if waiting
   // would not help.
-  std::optional<std::vector<BlockRef>> tryAllocateLocked(
-      Placement placement,
-      uint32_t count,
-      Clock::duration& wait);
+  std::optional<std::vector<BlockRef>>
+  tryAllocateLocked(Tier tier, uint32_t count, Clock::duration& wait);
 
-  // Evicts least recently used chunks of 'tier' until 'free' blocks (free
-  // now or after their grace period) are available.
-  void evictLocked(Tier tier, uint64_t free);
+  // Evicts copies in 'tier' of the least recently used chunks until
+  // 'available' blocks (free now or after their grace period) are.
+  void evictLocked(Tier tier, uint64_t available);
 
   // Moves blocks whose grace period is over to the free lists.
   void reclaimLocked(Clock::time_point now);
@@ -146,43 +161,60 @@ class Metadata : public rpc::MetadataRpc {
   // Frees blocks at once, or after the grace period.
   void freeLocked(const std::vector<BlockRef>& blocks, bool grace);
 
-  void eraseChunkLocked(
-      std::unordered_map<ChunkId, Chunk>::iterator chunk,
-      bool grace);
+  // Adds a copy to a chunk, journaling it if it is the chunk's copy in its
+  // write-through tier.
+  void addReplicaLocked(Chunk& chunk, Replica replica);
+
+  // Drops the chunk's copy in 'tier'; erases the chunk if it was the last.
+  // Returns the chunk's next iterator in chunks_.
+  ChunkMap::iterator dropReplicaLocked(ChunkMap::iterator chunk, Tier tier);
+
+  void eraseChunkLocked(ChunkMap::iterator chunk);
+
+  // Drops a region and the copies with blocks in it.
+  void dropRegionLocked(RegionId id);
+
+  // Whether all blocks of the copy are in regions of registered servers.
+  bool readableLocked(const Replica& replica) const;
 
   Server* serverOf(RegionId region);
 
   // Blocks of 'tier' whose grace period is not over.
   size_t graceBlocksLocked(Tier tier) const;
 
-  std::list<ChunkId>& lruOf(Tier tier) {
+  LruList& lruOf(Tier tier) {
     return lru_[static_cast<size_t>(tier)];
   }
+
+  // Applies a journal record.
+  void replay(folly::ByteRange record);
+
+  // The records that make up the current state, to rewrite the journal.
+  std::vector<std::string> snapshot();
+
+  void append(const RecordWriter& record);
 
   const MetadataOptions options_;
 
   mutable std::mutex mutex_;
   std::map<std::string, Server> servers_;
   std::map<RegionId, Region> regions_;
-  std::unordered_map<ChunkId, Chunk> chunks_;
-  // Per tier, least recently used first.
-  std::list<ChunkId> lru_[2];
+  ChunkMap chunks_;
+  // Per tier of blocks, least recently used first.
+  LruList lru_[kBlockTiers];
   // In the order they were freed, so in order of reusableAt.
   std::deque<GraceBlock> grace_;
-  RegionId nextRegionId_{1};
   // Where the next allocation starts its round over the regions.
   RegionId nextAllocation_{0};
   size_t evictions_{0};
-
-  // Applies a journal record.
-  void replayLocked(folly::ByteRange record);
-
-  void appendLocked(const RecordWriter& record);
 
   std::mutex refMutex_;
   std::map<std::string, Ref> refs_;
   // The version of the next update of any ref.
   uint64_t nextVersion_{1};
+
+  // Taken after mutex_ or refMutex_.
+  std::mutex journalMutex_;
   std::unique_ptr<Journal> journal_;
 };
 

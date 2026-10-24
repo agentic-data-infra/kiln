@@ -32,6 +32,7 @@ exception KilnException {
 enum Tier {
   DRAM = 0,
   LOCAL_FS = 1,
+  OBJECT_STORE = 2,
 }
 
 struct Endpoint {
@@ -77,13 +78,19 @@ struct ChunkId {
 
 struct Placement {
   1: Tier tier;
+  2: optional Tier writeThrough;
+}
+
+struct Replica {
+  1: Tier tier;
+  2: list<BlockRef> blocks;
 }
 
 struct ChunkInfo {
   1: ChunkId id;
   2: i64 size;
-  3: list<BlockRef> blocks;
-  4: Placement placement;
+  3: Placement placement;
+  4: list<Replica> replicas;
 }
 
 struct Ref {
@@ -123,9 +130,9 @@ service MetadataService {
 
   list<RegionInfo> getRegions(1: list<i64> ids) throws (1: KilnException e);
 
-  /// 'count' free blocks of length kBlockSize in the placement's tier,
-  /// evicting the least recently used chunks there if needed.
-  list<BlockRef> allocate(1: Placement placement, 2: i32 count) throws (
+  /// 'count' free blocks of length kBlockSize in the tier, evicting the
+  /// least recently used chunks there if needed.
+  list<BlockRef> allocate(1: Tier tier, 2: i32 count) throws (
     1: KilnException e,
   );
 
@@ -133,9 +140,11 @@ service MetadataService {
   void free(1: list<BlockRef> blocks) throws (1: KilnException e);
 
   /// Makes a chunk visible. The first commit of an id wins: later ones get
-  /// the first one's chunk and their blocks are freed.
+  /// the first one's chunk, with their copies in tiers it has no copy in
+  /// added, and the blocks of their other copies are freed.
   ChunkInfo commit(1: ChunkInfo chunk) throws (1: KilnException e);
 
+  /// The chunk with its copies that can be read now.
   ChunkInfo lookup(1: ChunkId id) throws (1: KilnException e);
 
   /// Returns whether the chunk existed. Its blocks are freed after the grace

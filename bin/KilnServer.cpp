@@ -5,10 +5,12 @@
 //               [--host=name]
 //               [--bind_host=name]
 //
-// Creates its regions (files in /dev/shm for DRAM, preallocated files under
-// --dir for the local FS), registers them with the metadata server, retrying
-// until it is up, and serves them. Its data is gone when it stops, on SIGINT
-// or SIGTERM.
+// Creates its regions (files in /dev/shm for DRAM, preallocated files for
+// the local FS), registers them with the metadata server, retrying until it
+// is up and again every few seconds, and serves them. Stops on SIGINT or
+// SIGTERM. A DRAM server's data is gone then; a local-FS server with --dir
+// keeps its region files there and reattaches them, with their data, when it
+// starts again.
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/init/Init.h>
@@ -24,7 +26,11 @@ DEFINE_string(tier, "dram", "dram or localfs.");
 DEFINE_int32(regions, 1, "Regions to create.");
 DEFINE_int64(region_size_mb, 1024, "Size of each region in MiB.");
 DEFINE_int64(budget_mb, 0, "MiB of the regions to use at most; 0 for all.");
-DEFINE_string(dir, "", "Where region files go; default /dev/shm or $TMPDIR.");
+DEFINE_string(
+    dir,
+    "",
+    "DRAM: where region files go, default /dev/shm. Local FS: this server's "
+    "own directory, kept across restarts; default a new one in $TMPDIR.");
 DEFINE_int32(port, 0, "Port to serve on; 0 for any.");
 DEFINE_string(host, "", "Host name clients reach this server by.");
 DEFINE_string(bind_host, "", "Interface to serve on; empty for all.");

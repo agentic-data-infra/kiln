@@ -7,6 +7,9 @@
 #       [-g grace_period_s] [-p metadata_port] [-j journal_file]
 #
 # Prints the metadata endpoint for `kiln --metadata=` (or $KILN_METADATA).
+# With a journal (-j), local-FS servers keep their regions in
+# $KILN_CLUSTER_DIR/localfs-<i>, so written-through chunks survive a stop and
+# start of the cluster.
 # Logs and pids go to $KILN_CLUSTER_DIR (default <tmp>/kiln-cluster); stop
 # the cluster with scripts/stop_local_cluster.sh.
 set -euo pipefail
@@ -53,10 +56,13 @@ server_bin=$(bin kiln_server)
 echo $! >>"$cluster_dir/pids"
 
 start_server() {
-  local tier=$1 i=$2
+  local tier=$1 i=$2 dir=
+  if [[ -n "$journal" && "$tier" == localfs ]]; then
+    dir="$cluster_dir/localfs-$i"
+  fi
   "$server_bin" --metadata="localhost:$port" --host=localhost --tier="$tier" \
     --regions="$regions" --region_size_mb="$region_size_mb" \
-    --budget_mb="$budget_mb" \
+    --budget_mb="$budget_mb" --dir="$dir" \
     >"$cluster_dir/server-$tier-$i.log" 2>&1 &
   echo $! >>"$cluster_dir/pids"
 }

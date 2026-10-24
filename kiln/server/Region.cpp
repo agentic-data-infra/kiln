@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -24,17 +25,27 @@ namespace {
 
 } // namespace
 
-Region::Region(Tier tier, std::string path, uint64_t length)
-    : tier_{tier}, path_{std::move(path)}, length_{length} {
-  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  if (fd_ < 0) {
+Region::Region(Tier tier, std::string path, uint64_t length, bool keep)
+    : tier_{tier}, path_{std::move(path)}, length_{length}, keep_{keep} {
+  fd_ = ::open(
+      path_.c_str(),
+      O_RDWR | O_CREAT | (keep_ ? 0 : O_EXCL) | O_CLOEXEC,
+      0600);
+  struct stat st;
+  if (fd_ < 0 || ::fstat(fd_, &st) != 0) {
     throwSystemError(fmt::format("Cannot create {}", path_), errno);
+  }
+  if (st.st_size > 0) {
+    // Reattached.
+    length_ = static_cast<uint64_t>(st.st_size);
   }
   // Reserve the space now, so a full disk or /dev/shm fails here and not on
   // a later write.
   if (int error = ::posix_fallocate(fd_, 0, static_cast<off_t>(length_))) {
     ::close(fd_);
-    ::unlink(path_.c_str());
+    if (!keep_) {
+      ::unlink(path_.c_str());
+    }
     throwSystemError(
         fmt::format("Cannot allocate {} bytes for {}", length_, path_), error);
   }
@@ -56,7 +67,7 @@ Region::~Region() {
     ::munmap(memory_, length_);
   }
   ::close(fd_);
-  if (::unlink(path_.c_str()) != 0) {
+  if (!keep_ && ::unlink(path_.c_str()) != 0) {
     PLOG(WARNING) << "Cannot remove " << path_;
   }
 }

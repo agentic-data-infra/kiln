@@ -11,14 +11,16 @@
 namespace kiln::server {
 
 // A storage server's region: 'length' bytes in a file at 'path', created when
-// the region is and removed with it. A DRAM region's file is in /dev/shm and
-// mapped into memory; a local-FS region's file is preallocated on disk and
-// accessed with pread/pwrite. Clients on the same host map the file
-// directly (ShmAccess). Thread safe.
+// the region is and removed with it, unless kept. A DRAM region's file is in
+// /dev/shm and mapped into memory; a local-FS region's file is preallocated
+// on disk and accessed with pread/pwrite. Clients on the same host map the
+// file directly (ShmAccess). Thread safe.
 class Region {
  public:
-  // Throws Error(kUnavailable) if the file cannot be created or sized.
-  Region(Tier tier, std::string path, uint64_t length);
+  // A kept region's file stays when the region is destroyed, and an
+  // existing file is reattached with its bytes and size. Throws
+  // Error(kUnavailable) if the file cannot be created or sized.
+  Region(Tier tier, std::string path, uint64_t length, bool keep = false);
 
   ~Region();
 
@@ -46,7 +48,8 @@ class Region {
 
   const Tier tier_;
   const std::string path_;
-  const uint64_t length_;
+  uint64_t length_;
+  const bool keep_;
   int fd_{-1};
   // The mapping of a DRAM region.
   uint8_t* memory_{nullptr};

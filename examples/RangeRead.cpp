@@ -51,7 +51,7 @@ folly::coro::Task<void> co_run(client::Client& client) {
       id.toString(),
       FLAGS_records,
       info.size,
-      info.blocks.size());
+      info.replicas[0].blocks.size());
 
   // Single records, read into one small buffer.
   auto record = client.allocateBuffer(kRecordSize);

@@ -52,7 +52,7 @@ folly::coro::Task<void> co_run(client::Client& client, const std::string& path) 
       "put {} ({} bytes, {} blocks in {}) in {:.3f}s\n",
       id.toString(),
       info.size,
-      info.blocks.size(),
+      info.replicas[0].blocks.size(),
       toString(info.placement.tier),
       secondsSince(start));
 

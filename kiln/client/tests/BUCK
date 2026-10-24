@@ -20,3 +20,16 @@ cxx_test(
     ],
     link_ordering = "topological",
 )
+
+cxx_test(
+    name = "durability_test",
+    srcs = ["DurabilityTest.cpp"],
+    deps = [
+        "//kiln/client:client",
+        "//kiln/meta:meta",
+        "//kiln/objectstore:objectstore",
+        "//kiln/server:server",
+        "//kiln/tests:test_main",
+    ],
+    link_ordering = "topological",
+)

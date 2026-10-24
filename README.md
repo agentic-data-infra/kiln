@@ -17,14 +17,41 @@ client as it writes them. The first commit of an id wins; a later writer of
 the same bytes gets the same id and its copy is dropped. All I/O interfaces
 are `folly::coro::Task` based.
 
-Today Kiln has the chunk store core: the metadata server, DRAM and local-FS
-storage servers (both ephemeral: their data is gone when they stop), and the
-client, which reaches regions over TCP or, on the same host, by mapping their
-files. Tiers fill up to the storage servers' byte budgets and then evict
-their least recently used chunks. Refs are kept by the metadata server, in a
-journal that survives restarts. An object store interface
-(`kiln/objectstore`) has a local-directory backend. Write-through to durable
-tiers and the catalog come next.
+Today Kiln has the metadata server; DRAM and local-FS storage servers; an
+object store interface (`kiln/objectstore`) with a local-directory backend;
+and the client, which reaches regions over TCP or, on the same host, by
+mapping their files. Tiers fill up to the storage servers' byte budgets and
+then evict their least recently used chunks. Chunks can be written through
+to a durable tier, and refs and written-through chunks survive restarts.
+The catalog comes next.
+
+## Tiers and write-through
+
+A chunk goes into DRAM or the local FS (`Placement::tier`), and, if
+`Placement::writeThrough` is set, also into a second tier before its commit
+returns: the local FS, or the object store (`ClientOptions::objectStore`),
+where it is the object `chunks/<id>`. The client writes both copies, and
+reads the fastest one it can reach (`co_stat` lists them).
+
+```cpp
+auto writer = co_await client.co_create(
+    {.tier = kiln::Tier::kDram, .writeThrough = kiln::Tier::kLocalFs});
+```
+
+Eviction drops a chunk's copy in one tier; the chunk is gone when it has no
+copy left. A written-through chunk whose DRAM copy was evicted is still read
+from its other copy, and writing the same bytes again brings the DRAM copy
+back.
+
+With a journal (`kiln_meta --journal=FILE`), the metadata server keeps the
+copies of written-through chunks in their write-through tier, along with
+refs and local-FS regions, across restarts. A local-FS storage server with
+its own directory (`kiln_server --dir`) keeps its region files when it stops
+and reattaches them when it starts; storage servers register again every few
+seconds, so a restarted metadata server learns of them. Until a chunk's
+storage server has registered again, the chunk reads as `kUnavailable`.
+Chunks that are not written through, and all of DRAM, are gone after a
+restart. Objects of removed chunks stay in the object store for now.
 
 ## Refs
 
@@ -40,7 +67,7 @@ optionally only at a given version.
 
 With `kiln_meta --journal=FILE`, every ref update is appended to the journal
 and synced to disk before the call returns, and a restarted metadata server
-replays it (and then rewrites it with just the current refs). Without a
+replays it (and then rewrites it with just its current state). Without a
 journal, refs are gone when the metadata server stops.
 
 ## Eviction
@@ -48,8 +75,9 @@ journal, refs are gone when the metadata server stops.
 Each storage server registers its regions with a byte budget (`kiln_server
 --budget_mb`, default all of its regions). When an allocation would leave
 less than 10% of a tier's budget free, the metadata server evicts the tier's
-least recently committed or looked up chunks until 20% is free. An evicted
-chunk is gone: `co_stat` and `co_read` fail with `kNotFound`.
+least recently committed or looked up chunks there until 20% is free. A
+chunk evicted from its only tier is gone: `co_stat` and `co_read` fail with
+`kNotFound`.
 
 The blocks of an evicted or removed chunk are reused only after a grace
 period (`kiln_meta --grace_period_s`, default 30 s). Clients cache a chunk's
@@ -80,6 +108,8 @@ A cluster on this machine, and the command line client:
 metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server; -b budget_mb, -j journal
 kiln() { $(buck2 build //bin:kiln --show-full-output | awk '{print $2}') --metadata=$metadata "$@"; }
 id=$(kiln put some/file)                # --tier=localfs for the local FS
+kiln --write_through=localfs put some/file
+kiln --object_store=/some/dir --write_through=objectstore put some/file
 kiln stat $id
 kiln get $id copy                       # --tcp_only to skip shared memory
 kiln rm $id

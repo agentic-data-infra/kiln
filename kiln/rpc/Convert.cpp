@@ -95,19 +95,39 @@ ChunkId fromThrift(const thrift::ChunkId& id) {
 thrift::Placement toThrift(const Placement& placement) {
   thrift::Placement result;
   result.tier() = static_cast<thrift::Tier>(placement.tier);
+  if (placement.writeThrough) {
+    result.writeThrough() = static_cast<thrift::Tier>(*placement.writeThrough);
+  }
   return result;
 }
 
 Placement fromThrift(const thrift::Placement& placement) {
-  return Placement{.tier = static_cast<Tier>(*placement.tier())};
+  Placement result{.tier = static_cast<Tier>(*placement.tier())};
+  if (placement.writeThrough()) {
+    result.writeThrough = static_cast<Tier>(*placement.writeThrough());
+  }
+  return result;
+}
+
+thrift::Replica toThrift(const Replica& replica) {
+  thrift::Replica result;
+  result.tier() = static_cast<thrift::Tier>(replica.tier);
+  result.blocks() = toThrift(replica.blocks);
+  return result;
+}
+
+Replica fromThrift(const thrift::Replica& replica) {
+  return Replica{
+      .tier = static_cast<Tier>(*replica.tier()),
+      .blocks = fromThrift(*replica.blocks())};
 }
 
 thrift::ChunkInfo toThrift(const ChunkInfo& chunk) {
   thrift::ChunkInfo result;
   result.id() = toThrift(chunk.id);
   result.size() = static_cast<int64_t>(chunk.size);
-  result.blocks() = toThrift(chunk.blocks);
   result.placement() = toThrift(chunk.placement);
+  result.replicas() = toThrift(chunk.replicas);
   return result;
 }
 
@@ -115,8 +135,8 @@ ChunkInfo fromThrift(const thrift::ChunkInfo& chunk) {
   return ChunkInfo{
       .id = fromThrift(*chunk.id()),
       .size = static_cast<uint64_t>(*chunk.size()),
-      .blocks = fromThrift(*chunk.blocks()),
-      .placement = fromThrift(*chunk.placement())};
+      .placement = fromThrift(*chunk.placement()),
+      .replicas = fromThrift(*chunk.replicas())};
 }
 
 thrift::Ref toThrift(const Ref& ref) {
