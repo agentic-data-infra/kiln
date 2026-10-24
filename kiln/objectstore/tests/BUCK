@@ -1,0 +1,10 @@
+cxx_test(
+    name = "objectstore_test",
+    srcs = ["ObjectStoreTest.cpp"],
+    deps = [
+        "//kiln/objectstore:objectstore",
+        "//kiln/tests:test_main",
+    ],
+    # Archives must precede the prebuilt libraries they use.
+    link_ordering = "topological",
+)

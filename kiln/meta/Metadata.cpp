@@ -9,7 +9,82 @@
 
 namespace kiln::meta {
 
-Metadata::Metadata(MetadataOptions options) : options_{options} {}
+namespace {
+
+// Journal records, by their first byte.
+enum RecordKind : uint8_t {
+  // A ref's name, value and version.
+  kRefSet = 1,
+  // A ref's name.
+  kRefRemoved = 2,
+  // The version of the next ref update, so that versions of removed refs
+  // are not reused after the journal is rewritten.
+  kNextVersion = 3,
+};
+
+void checkRefName(const std::string& name) {
+  if (name.empty() || name.size() > kMaxRefNameSize) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format(
+            "Ref name of {} bytes, not 1 to {}",
+            name.size(),
+            kMaxRefNameSize));
+  }
+}
+
+} // namespace
+
+Metadata::Metadata(MetadataOptions options) : options_{std::move(options)} {
+  if (options_.journal.empty()) {
+    return;
+  }
+  std::lock_guard lock(refMutex_);
+  journal_ = std::make_unique<Journal>(
+      options_.journal, [&](folly::ByteRange record) { replayLocked(record); });
+  // Keep only the records that make up the current state.
+  std::vector<std::string> records;
+  records.push_back(RecordWriter().u8(kNextVersion).u64(nextVersion_).record());
+  for (const auto& [name, ref] : refs_) {
+    records.push_back(RecordWriter()
+                          .u8(kRefSet)
+                          .string(ref.name)
+                          .string(ref.value)
+                          .u64(ref.version)
+                          .record());
+  }
+  journal_->rewrite(records);
+}
+
+Metadata::~Metadata() = default;
+
+void Metadata::replayLocked(folly::ByteRange record) {
+  RecordReader reader(record);
+  switch (reader.u8()) {
+    case kRefSet: {
+      Ref ref{.name = reader.string(), .value = reader.string()};
+      ref.version = reader.u64();
+      nextVersion_ = std::max(nextVersion_, ref.version + 1);
+      auto name = ref.name;
+      refs_[std::move(name)] = std::move(ref);
+      break;
+    }
+    case kRefRemoved:
+      refs_.erase(reader.string());
+      break;
+    case kNextVersion:
+      nextVersion_ = std::max(nextVersion_, reader.u64());
+      break;
+    default:
+      throw Error(ErrorCode::kInternal, "Unknown journal record");
+  }
+}
+
+void Metadata::appendLocked(const RecordWriter& record) {
+  if (journal_) {
+    journal_->append(folly::StringPiece(record.record()));
+  }
+}
 
 folly::coro::Task<std::vector<RegionInfo>> Metadata::co_registerServer(
     std::vector<RegionInfo> regions,
@@ -352,6 +427,72 @@ folly::coro::Task<bool> Metadata::co_remove(ChunkId id) {
     co_return false;
   }
   eraseChunkLocked(it, /*grace=*/true);
+  co_return true;
+}
+
+folly::coro::Task<std::optional<Ref>> Metadata::co_getRef(std::string name) {
+  std::lock_guard lock(refMutex_);
+  auto it = refs_.find(name);
+  if (it == refs_.end()) {
+    co_return std::nullopt;
+  }
+  co_return it->second;
+}
+
+folly::coro::Task<std::optional<Ref>> Metadata::co_casRef(
+    std::string name,
+    std::optional<uint64_t> expectedVersion,
+    std::string value) {
+  checkRefName(name);
+  if (value.size() > kMaxRefValueSize) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format(
+            "Ref value of {} bytes is over {}",
+            value.size(),
+            kMaxRefValueSize));
+  }
+  std::lock_guard lock(refMutex_);
+  auto it = refs_.find(name);
+  const auto version = it == refs_.end()
+      ? std::optional<uint64_t>()
+      : std::optional<uint64_t>(it->second.version);
+  if (version != expectedVersion) {
+    co_return std::nullopt;
+  }
+  Ref ref{.name = name, .value = std::move(value), .version = nextVersion_};
+  appendLocked(RecordWriter()
+                   .u8(kRefSet)
+                   .string(ref.name)
+                   .string(ref.value)
+                   .u64(ref.version));
+  ++nextVersion_;
+  refs_[std::move(name)] = ref;
+  co_return ref;
+}
+
+folly::coro::Task<std::vector<Ref>> Metadata::co_listRefs(std::string prefix) {
+  std::lock_guard lock(refMutex_);
+  std::vector<Ref> result;
+  for (auto it = refs_.lower_bound(prefix);
+       it != refs_.end() && it->first.starts_with(prefix);
+       ++it) {
+    result.push_back(it->second);
+  }
+  co_return result;
+}
+
+folly::coro::Task<bool> Metadata::co_removeRef(
+    std::string name,
+    std::optional<uint64_t> expectedVersion) {
+  std::lock_guard lock(refMutex_);
+  auto it = refs_.find(name);
+  if (it == refs_.end() ||
+      (expectedVersion && it->second.version != *expectedVersion)) {
+    co_return false;
+  }
+  appendLocked(RecordWriter().u8(kRefRemoved).string(name));
+  refs_.erase(it);
   co_return true;
 }
 

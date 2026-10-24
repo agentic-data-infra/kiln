@@ -118,4 +118,19 @@ struct ChunkInfo {
   bool operator==(const ChunkInfo&) const = default;
 };
 
+// A small named value with a version, kept by the metadata server, e.g. a
+// pointer to the chunk that holds a catalog's latest commit. Updates are
+// compare-and-swap on the version, which grows with every update of any
+// ref, so a removed and recreated ref never repeats a version.
+struct Ref {
+  std::string name;
+  std::string value;
+  uint64_t version{0};
+
+  bool operator==(const Ref&) const = default;
+};
+
+constexpr size_t kMaxRefNameSize = 256;
+constexpr size_t kMaxRefValueSize = 1024;
+
 } // namespace kiln

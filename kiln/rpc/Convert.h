@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <optional>
 #include <vector>
 
 #include "kiln/common/Error.h"
@@ -27,6 +28,12 @@ Placement fromThrift(const thrift::Placement& placement);
 
 thrift::ChunkInfo toThrift(const ChunkInfo& chunk);
 ChunkInfo fromThrift(const thrift::ChunkInfo& chunk);
+
+thrift::Ref toThrift(const Ref& ref);
+Ref fromThrift(const thrift::Ref& ref);
+
+thrift::RefLookup toThrift(const std::optional<Ref>& ref);
+std::optional<Ref> fromThrift(const thrift::RefLookup& lookup);
 
 thrift::KilnException toThrift(const Error& error);
 Error fromThrift(const thrift::KilnException& error);

@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -73,6 +75,29 @@ class Client {
 
   // Returns whether the chunk existed.
   folly::coro::Task<bool> co_remove(ChunkId id);
+
+  // Refs: small named values on the metadata server, updated with compare
+  // and swap (see Ref and rpc::MetadataRpc).
+
+  // The ref, or nullopt if there is none.
+  folly::coro::Task<std::optional<Ref>> co_getRef(std::string name);
+
+  // Sets the ref to 'value' if its version is 'expectedVersion', or, with
+  // nullopt, if there is no such ref. Returns the updated ref, or nullopt if
+  // the version did not match.
+  folly::coro::Task<std::optional<Ref>> co_casRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion,
+      std::string value);
+
+  // The refs whose names start with 'prefix', by name.
+  folly::coro::Task<std::vector<Ref>> co_listRefs(std::string prefix);
+
+  // Removes the ref if its version is 'expectedVersion', or, with nullopt,
+  // whatever its version. Returns whether it did.
+  folly::coro::Task<bool> co_removeRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion = std::nullopt);
 
  private:
   friend class ChunkWriter;

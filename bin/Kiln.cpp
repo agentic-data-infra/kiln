@@ -4,15 +4,21 @@
 //   kiln [--metadata=host:port] get ID [FILE]
 //   kiln [--metadata=host:port] stat ID
 //   kiln [--metadata=host:port] rm ID
+//   kiln [--metadata=host:port] ref get NAME
+//   kiln [--metadata=host:port] ref set NAME VALUE [VERSION]
+//   kiln [--metadata=host:port] ref ls [PREFIX]
+//   kiln [--metadata=host:port] ref rm NAME [VERSION]
 //
 // put stores FILE (- for stdin) as one chunk and prints its id; get writes
-// the chunk to FILE or stdout. --metadata defaults to $KILN_METADATA, else
+// the chunk to FILE or stdout. ref set creates the ref, or with VERSION
+// updates it if it is at that version, and prints the new version. --metadata defaults to $KILN_METADATA, else
 // localhost:7470.
 
 #include <cstdio>
 #include <cstdlib>
 
 #include <fmt/format.h>
+#include <folly/Conv.h>
 #include <folly/coro/BlockingWait.h>
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
@@ -92,6 +98,60 @@ folly::coro::Task<void> co_stat(client::Client& client, ChunkId id) {
   }
 }
 
+// "kiln ref ..."; returns the exit code.
+folly::coro::Task<int> co_ref(
+    client::Client& client,
+    const std::vector<std::string>& args) {
+  const std::string command = args.size() > 1 ? args[1] : "";
+  std::optional<uint64_t> version;
+  auto parseVersion = [&](size_t i) {
+    if (args.size() > i) {
+      const auto parsed = folly::tryTo<uint64_t>(args[i]);
+      if (!parsed) {
+        throw Error(
+            ErrorCode::kInvalidArgument,
+            fmt::format("Bad version '{}'", args[i]));
+      }
+      version = *parsed;
+    }
+  };
+  if (command == "get" && args.size() == 3) {
+    auto ref = co_await client.co_getRef(args[2]);
+    if (!ref) {
+      fmt::print(stderr, "No ref {}\n", args[2]);
+      co_return 1;
+    }
+    fmt::print("{}\t{}\n", ref->version, ref->value);
+  } else if (command == "set" && (args.size() == 4 || args.size() == 5)) {
+    parseVersion(4);
+    auto ref = co_await client.co_casRef(args[2], version, args[3]);
+    if (!ref) {
+      fmt::print(stderr, "Ref {} is not at the expected version\n", args[2]);
+      co_return 1;
+    }
+    fmt::print("{}\n", ref->version);
+  } else if (command == "ls" && (args.size() == 2 || args.size() == 3)) {
+    // Named: GCC 12 destroys a ?: temporary in a co_await's arguments twice.
+    const std::string prefix = args.size() == 3 ? args[2] : "";
+    for (const auto& ref : co_await client.co_listRefs(prefix)) {
+      fmt::print("{}\t{}\t{}\n", ref.name, ref.version, ref.value);
+    }
+  } else if (command == "rm" && (args.size() == 3 || args.size() == 4)) {
+    parseVersion(3);
+    if (!co_await client.co_removeRef(args[2], version)) {
+      fmt::print(stderr, "No ref {} at the expected version\n", args[2]);
+      co_return 1;
+    }
+  } else {
+    fmt::print(
+        stderr,
+        "Usage: kiln ref get NAME | set NAME VALUE [VERSION] | ls [PREFIX] | "
+        "rm NAME [VERSION]\n");
+    co_return 2;
+  }
+  co_return 0;
+}
+
 folly::coro::Task<int> co_main(const std::vector<std::string>& args) {
   std::string metadata = FLAGS_metadata;
   if (metadata.empty()) {
@@ -115,8 +175,10 @@ folly::coro::Task<int> co_main(const std::vector<std::string>& args) {
       fmt::print(stderr, "No chunk {}\n", args[1]);
       co_return 1;
     }
+  } else if (command == "ref") {
+    co_return co_await co_ref(client, args);
   } else {
-    fmt::print(stderr, "Usage: kiln put FILE | get ID [FILE] | stat ID | rm ID\n");
+    fmt::print(stderr, "Usage: kiln put FILE | get ID [FILE] | stat ID | rm ID | ref ...\n");
     co_return 2;
   }
   co_return 0;
@@ -126,10 +188,10 @@ folly::coro::Task<int> co_main(const std::vector<std::string>& args) {
 } // namespace kiln
 
 int main(int argc, char** argv) {
-  gflags::SetUsageMessage("kiln put FILE | get ID [FILE] | stat ID | rm ID");
+  gflags::SetUsageMessage("kiln put FILE | get ID [FILE] | stat ID | rm ID | ref ...");
   folly::Init init(&argc, &argv);
   if (argc < 2) {
-    fmt::print(stderr, "Usage: kiln put FILE | get ID [FILE] | stat ID | rm ID\n");
+    fmt::print(stderr, "Usage: kiln put FILE | get ID [FILE] | stat ID | rm ID | ref ...\n");
     return 2;
   }
   const std::vector<std::string> args(argv + 1, argv + argc);

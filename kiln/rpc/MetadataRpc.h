@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <folly/coro/Task.h>
@@ -46,6 +48,28 @@ class MetadataRpc {
   // Returns whether the chunk existed. Its blocks are freed after the grace
   // period, so readers that looked it up just before can still finish.
   virtual folly::coro::Task<bool> co_remove(ChunkId id) = 0;
+
+  // The ref, or nullopt if there is none.
+  virtual folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) = 0;
+
+  // Sets the ref to 'value' if its version is 'expectedVersion', or, with
+  // nullopt, if there is no such ref. Returns the updated ref, or nullopt if
+  // the version did not match. Names have at most kMaxRefNameSize bytes and
+  // values kMaxRefValueSize.
+  virtual folly::coro::Task<std::optional<Ref>> co_casRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion,
+      std::string value) = 0;
+
+  // The refs whose names start with 'prefix', by name.
+  virtual folly::coro::Task<std::vector<Ref>> co_listRefs(
+      std::string prefix) = 0;
+
+  // Removes the ref if its version is 'expectedVersion', or, with nullopt,
+  // whatever its version. Returns whether it did.
+  virtual folly::coro::Task<bool> co_removeRef(
+      std::string name,
+      std::optional<uint64_t> expectedVersion) = 0;
 };
 
 } // namespace kiln::rpc

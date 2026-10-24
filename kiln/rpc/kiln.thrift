@@ -86,6 +86,30 @@ struct ChunkInfo {
   4: Placement placement;
 }
 
+struct Ref {
+  1: string name;
+  2: binary value;
+  3: i64 version;
+}
+
+/// A ref, if there is one.
+struct RefLookup {
+  1: optional Ref ref;
+}
+
+struct CasRefRequest {
+  1: string name;
+  /// Unset: only if there is no such ref.
+  2: optional i64 expectedVersion;
+  3: binary value;
+}
+
+struct RemoveRefRequest {
+  1: string name;
+  /// Unset: whatever the ref's version.
+  2: optional i64 expectedVersion;
+}
+
 service MetadataService {
   /// Returns 'message'.
   string ping(1: string message);
@@ -117,6 +141,18 @@ service MetadataService {
   /// Returns whether the chunk existed. Its blocks are freed after the grace
   /// period.
   bool remove(1: ChunkId id) throws (1: KilnException e);
+
+  RefLookup getRef(1: string name) throws (1: KilnException e);
+
+  /// Sets the ref if its version is the expected one; returns the updated
+  /// ref, or none if the version did not match.
+  RefLookup casRef(1: CasRefRequest request) throws (1: KilnException e);
+
+  /// The refs whose names start with 'prefix', by name.
+  list<Ref> listRefs(1: string prefix) throws (1: KilnException e);
+
+  /// Returns whether the ref was removed.
+  bool removeRef(1: RemoveRefRequest request) throws (1: KilnException e);
 }
 
 service StorageService {
