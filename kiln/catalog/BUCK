@@ -1,0 +1,9 @@
+cxx_library(
+    name = "catalog",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/catalog",
+    exported_headers = glob(["*.h"]),
+    exported_deps = ["//kiln/common:common"],
+    deps = ["//kiln/client:client"],
+    visibility = ["PUBLIC"],
+)

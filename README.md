@@ -23,7 +23,7 @@ and the client, which reaches regions over TCP or, on the same host, by
 mapping their files. Tiers fill up to the storage servers' byte budgets and
 then evict their least recently used chunks. Chunks can be written through
 to a durable tier, and refs and written-through chunks survive restarts.
-The catalog comes next.
+The catalog keeps memos of results (below).
 
 ## Tiers and write-through
 
@@ -88,6 +88,32 @@ allocation that only blocks in their grace period could satisfy waits for
 them; one that even evicting everything cannot satisfy (the tier is full of
 chunks being written) fails with `kOutOfSpace`.
 
+## Memos
+
+The catalog (`kiln/catalog`) is a client library on the public client API.
+Its memos map a key, e.g. a query plan's fingerprint, to a manifest: the
+chunks (or byte ranges of them) that hold the result, an opaque schema, row
+and byte counts, and properties.
+
+```cpp
+kiln::catalog::Catalog catalog(client);
+if (auto manifest = co_await catalog.co_getMemo(key)) {
+  // Read manifest->chunks.
+} else {
+  // Compute the result into chunks, then:
+  kiln::catalog::Manifest computed{.chunks = {{.id = id}}, .rows = n, .bytes = size};
+  co_await catalog.co_putMemo(key, std::move(computed));
+}
+```
+
+A manifest is a chunk written through to the local FS, and a memo is the
+ref `memo/<hash of the key>` pointing at it, created once. `co_getMemo`
+returns a manifest only if all chunks it lists can still be read; a memo
+whose chunks are gone (evicted, or lost with DRAM in a restart) is removed,
+so the result is recomputed and memoed again. `examples/memo_restart.sh`
+shows a memo of written-through data surviving a cluster restart, and one of
+DRAM-only data turning into a miss.
+
 ## Using it
 
 ```cpp
@@ -127,6 +153,7 @@ The examples and the benchmark run against a cluster in their own process
 ```
 buck2 run //examples:put_get_file -- some/file
 buck2 run //examples:range_read
+examples/memo_restart.sh                 # starts and stops its own cluster
 buck2 run //bench:transport_benchmark
 ```
 
@@ -153,7 +180,7 @@ TCP over loopback, it measured:
 - `kiln/client`: the client library and its transports.
 - `kiln/local`: a whole cluster in one process, for tests, examples and
   benchmarks.
-- `kiln/catalog`: refs and the catalog (to come).
+- `kiln/catalog`: the catalog's memos, on the public client API.
 - `bin`: `kiln_meta`, `kiln_server` and the `kiln` command line client.
 - `examples`, `bench`.
 

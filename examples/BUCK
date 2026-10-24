@@ -18,3 +18,13 @@ cxx_binary(
     ],
     link_ordering = "topological",
 )
+
+cxx_binary(
+    name = "memo",
+    srcs = ["Memo.cpp"],
+    deps = [
+        "//kiln/catalog:catalog",
+        "//kiln/client:client",
+    ],
+    link_ordering = "topological",
+)
