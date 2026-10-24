@@ -2,13 +2,19 @@
 # prebuilt libraries. Flags come from third-party/generated/deps.bzl, which
 # scripts/gen_third_party.py derives from CMake.
 
+load("//third-party:check_deps.bzl", "check_deps")
 load(
     "//third-party/generated:deps.bzl",
+    # Missing in files generated for GCC 11's folly: rerun
+    # scripts/gen_third_party.py.
+    "DEPS_PREFIX",
     "GTEST_LINKER_FLAGS",
     "GTEST_PREPROCESSOR_FLAGS",
     "LINKER_FLAGS",
     "PREPROCESSOR_FLAGS",
 )
+
+check_deps(DEPS_PREFIX)
 
 # folly (with folly::coro), glog and gflags, and fbthrift's C++ runtime. The
 # installed fbthrift is the one Velox's setup scripts build, with the same
