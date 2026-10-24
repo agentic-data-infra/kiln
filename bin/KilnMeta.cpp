@@ -1,6 +1,6 @@
 // kiln_meta: Kiln's metadata server.
 //
-//   kiln_meta [--port=P] [--bind_host=name]
+//   kiln_meta [--port=P] [--bind_host=name] [--grace_period_s=S]
 //
 // Storage servers register their regions here, and clients ask it for blocks
 // and where chunks are. Its state is in memory. Stops on SIGINT or SIGTERM.
@@ -15,13 +15,19 @@
 
 DEFINE_int32(port, 7470, "Port to serve on.");
 DEFINE_string(bind_host, "", "Interface to serve on; empty for all.");
+DEFINE_int32(
+    grace_period_s,
+    30,
+    "Seconds before blocks of removed or evicted chunks are reused.");
 
 int main(int argc, char** argv) {
   FLAGS_logtostderr = true;
   folly::Init init(&argc, &argv);
   const auto signals = kiln::blockStopSignals();
 
-  auto metadata = std::make_shared<kiln::meta::Metadata>();
+  auto metadata =
+      std::make_shared<kiln::meta::Metadata>(kiln::meta::MetadataOptions{
+          .gracePeriod = std::chrono::seconds(FLAGS_grace_period_s)});
   auto server = kiln::rpc::serveMetadata(
       metadata, FLAGS_bind_host, static_cast<uint16_t>(FLAGS_port));
   LOG(INFO) << "Metadata server on port " << server->port();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,11 @@ struct ClientOptions {
   // Reach regions on this host by mapping their files instead of over TCP.
   // Off to force TCP, e.g. to test it on one host.
   bool useShm{true};
+  // How long a chunk's info is used without asking the metadata server
+  // again. Must be well below the metadata server's grace period
+  // (MetadataOptions::gracePeriod), after which the blocks of an evicted or
+  // removed chunk are reused.
+  std::chrono::milliseconds chunkCacheTtl{std::chrono::seconds(10)};
 };
 
 class ChunkWriter;
@@ -86,8 +92,15 @@ class Client {
 
   std::mutex mutex_;
   std::unordered_map<RegionId, RegionInfo> regions_;
-  // Chunks are immutable, so their infos stay valid until removed.
-  std::unordered_map<ChunkId, ChunkInfo> chunks_;
+  struct CachedChunk {
+    ChunkInfo info;
+    std::chrono::steady_clock::time_point expires;
+  };
+
+  // Chunks are immutable, so their infos are valid until removed or
+  // evicted; lookups after the TTL also tell the metadata server which
+  // chunks are in use.
+  std::unordered_map<ChunkId, CachedChunk> chunks_;
 };
 
 // Writes one chunk: append its bytes, then commit to get its id. The bytes

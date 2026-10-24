@@ -7,7 +7,7 @@
 namespace kiln::local {
 
 LocalCluster::LocalCluster(LocalClusterOptions options)
-    : metadata_{std::make_shared<meta::Metadata>()},
+    : metadata_{std::make_shared<meta::Metadata>(options.metadata)},
       metadataServer_{rpc::serveMetadata(metadata_, "127.0.0.1", 0)},
       metadataEndpoint_{"127.0.0.1", metadataServer_->port()} {
   auto start = [&](Tier tier, const std::string& dir) {
@@ -19,6 +19,7 @@ LocalCluster::LocalCluster(LocalClusterOptions options)
             .tier = tier,
             .regions = options.regionsPerServer,
             .regionSize = options.regionSize,
+            .budget = options.budget,
             .dir = dir})));
   };
   for (uint32_t i = 0; i < options.dramServers; ++i) {

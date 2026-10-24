@@ -44,7 +44,13 @@ class ClientTest : public testing::TestWithParam<bool> {
         .dramServers = 2,
         .localFsServers = 2,
         .regionsPerServer = 2,
-        .regionSize = 16 << 20});
+        .regionSize = 16 << 20,
+        // Exact block counts: freed blocks are free at once, and nothing is
+        // evicted before it has to be (EvictionTest covers eviction).
+        .metadata = meta::MetadataOptions{
+            .gracePeriod = std::chrono::milliseconds(0),
+            .evictBelow = 0,
+            .evictUntil = 0}});
   }
 
   static void TearDownTestSuite() {

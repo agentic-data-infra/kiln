@@ -1,7 +1,8 @@
 // kiln_server: a Kiln storage server.
 //
 //   kiln_server --metadata=host:port [--tier=dram|localfs] [--regions=N]
-//               [--region_size_mb=M] [--dir=D] [--port=P] [--host=name]
+//               [--region_size_mb=M] [--budget_mb=B] [--dir=D] [--port=P]
+//               [--host=name]
 //               [--bind_host=name]
 //
 // Creates its regions (files in /dev/shm for DRAM, preallocated files under
@@ -22,6 +23,7 @@ DEFINE_string(metadata, "", "The metadata server, host:port.");
 DEFINE_string(tier, "dram", "dram or localfs.");
 DEFINE_int32(regions, 1, "Regions to create.");
 DEFINE_int64(region_size_mb, 1024, "Size of each region in MiB.");
+DEFINE_int64(budget_mb, 0, "MiB of the regions to use at most; 0 for all.");
 DEFINE_string(dir, "", "Where region files go; default /dev/shm or $TMPDIR.");
 DEFINE_int32(port, 0, "Port to serve on; 0 for any.");
 DEFINE_string(host, "", "Host name clients reach this server by.");
@@ -48,6 +50,7 @@ int main(int argc, char** argv) {
             .tier = kiln::parseTier(FLAGS_tier),
             .regions = static_cast<uint32_t>(FLAGS_regions),
             .regionSize = static_cast<uint64_t>(FLAGS_region_size_mb) << 20,
+            .budget = static_cast<uint64_t>(FLAGS_budget_mb) << 20,
             .dir = FLAGS_dir,
             .connectTimeout = std::chrono::seconds(FLAGS_connect_timeout_s)}));
   } catch (const kiln::Error& e) {

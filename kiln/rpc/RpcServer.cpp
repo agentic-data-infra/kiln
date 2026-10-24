@@ -42,9 +42,13 @@ class MetadataService
 
   folly::coro::Task<std::unique_ptr<std::vector<thrift::RegionInfo>>>
   co_registerServer(
-      std::unique_ptr<std::vector<thrift::RegionInfo>> regions) override {
-    auto result = co_await guarded(
-        metadata_->co_registerServer(fromThrift(*regions)));
+      std::unique_ptr<std::vector<thrift::RegionInfo>> regions,
+      int64_t budget) override {
+    if (budget < 0) {
+      throw toThrift(Error(ErrorCode::kInvalidArgument, "Negative budget"));
+    }
+    auto result = co_await guarded(metadata_->co_registerServer(
+        fromThrift(*regions), static_cast<uint64_t>(budget)));
     co_return boxed(toThrift(result));
   }
 

@@ -110,8 +110,14 @@ int main(int argc, char** argv) {
   folly::Init init(&argc, &argv);
   // Room for one chunk per tier and server; blocks spread over both.
   const uint64_t regionSize = ((FLAGS_size_mb + 1) / 2 + 1) << 20;
+  // Each chunk is removed before the next is written; its blocks are
+  // reusable at once.
   local::LocalCluster cluster(local::LocalClusterOptions{
-      .dramServers = 2, .localFsServers = 2, .regionSize = regionSize});
+      .dramServers = 2,
+      .localFsServers = 2,
+      .regionSize = regionSize,
+      .metadata = meta::MetadataOptions{
+          .gracePeriod = std::chrono::milliseconds(0)}});
 
   fmt::print(
       "{} MiB chunk, appended in {} MiB pieces, read {} times\n",

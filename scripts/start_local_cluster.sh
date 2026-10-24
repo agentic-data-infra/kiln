@@ -3,7 +3,8 @@
 # storage servers, as separate processes as they would be on different hosts.
 #
 #   scripts/start_local_cluster.sh [-d dram_servers] [-l localfs_servers]
-#       [-r regions_per_server] [-s region_size_mb] [-p metadata_port]
+#       [-r regions_per_server] [-s region_size_mb] [-b budget_mb]
+#       [-g grace_period_s] [-p metadata_port]
 #
 # Prints the metadata endpoint for `kiln --metadata=` (or $KILN_METADATA).
 # Logs and pids go to $KILN_CLUSTER_DIR (default <tmp>/kiln-cluster); stop
@@ -14,13 +15,17 @@ dram=1
 localfs=1
 regions=1
 region_size_mb=1024
+budget_mb=0
+grace_period_s=30
 port=7470
-while getopts "d:l:r:s:p:" opt; do
+while getopts "d:l:r:s:b:g:p:" opt; do
   case $opt in
     d) dram=$OPTARG ;;
     l) localfs=$OPTARG ;;
     r) regions=$OPTARG ;;
     s) region_size_mb=$OPTARG ;;
+    b) budget_mb=$OPTARG ;;
+    g) grace_period_s=$OPTARG ;;
     p) port=$OPTARG ;;
     *) exit 2 ;;
   esac
@@ -33,6 +38,7 @@ if [[ -s "$cluster_dir/pids" ]]; then
   exit 1
 fi
 mkdir -p "$cluster_dir"
+rm -f "$cluster_dir"/*.log
 
 bin() {
   (cd "$root" && buck2 build "//bin:$1" --show-full-output 2>/dev/null | awk '{print $2}')
@@ -40,13 +46,14 @@ bin() {
 meta_bin=$(bin kiln_meta)
 server_bin=$(bin kiln_server)
 
-"$meta_bin" --port="$port" >"$cluster_dir/meta.log" 2>&1 &
+"$meta_bin" --port="$port" --grace_period_s="$grace_period_s" >"$cluster_dir/meta.log" 2>&1 &
 echo $! >>"$cluster_dir/pids"
 
 start_server() {
   local tier=$1 i=$2
   "$server_bin" --metadata="localhost:$port" --host=localhost --tier="$tier" \
     --regions="$regions" --region_size_mb="$region_size_mb" \
+    --budget_mb="$budget_mb" \
     >"$cluster_dir/server-$tier-$i.log" 2>&1 &
   echo $! >>"$cluster_dir/pids"
 }
