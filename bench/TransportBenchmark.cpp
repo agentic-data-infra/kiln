@@ -130,20 +130,19 @@ int main(int argc, char** argv) {
       FLAGS_rounds);
   for (bool shm : {false, true}) {
     client::Client client(client::ClientOptions{
-        .metadata = cluster.metadataEndpoint(), .useShm = shm});
+        .metadata = cluster.metadataEndpoint(), .dataForceTcp = !shm});
     for (auto tier : {Tier::kDram, Tier::kLocalFs}) {
       folly::coro::blockingWait(co_measure(client, tier, shm ? "shm" : "tcp"));
     }
   }
 #if KILN_RDMA
-  try {
-    client::Client client(client::ClientOptions{
-        .metadata = cluster.metadataEndpoint(),
-        .useShm = false,
-        .useRdma = true});
+  // Data over RDMA, even on this host; metadata over TCP as above.
+  client::Client client(client::ClientOptions{
+      .metadata = cluster.metadataEndpoint(), .useShm = false});
+  if (client.stats().rdmaData) {
     folly::coro::blockingWait(co_measure(client, Tier::kDram, "rdma"));
-  } catch (const Error& e) {
-    fmt::print("No RDMA: {}\n", e.what());
+  } else {
+    fmt::print("No RDMA device\n");
   }
 #endif
   measureLocalFile();

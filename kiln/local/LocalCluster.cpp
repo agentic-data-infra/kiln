@@ -20,12 +20,13 @@ namespace kiln::local {
 LocalCluster::LocalCluster(LocalClusterOptions options)
     : metadata_{std::make_shared<meta::Metadata>(options.metadata)},
       metadataServer_{rpc::serveMetadata(metadata_, "127.0.0.1", 0)},
-      metadataEndpoint_{"127.0.0.1", metadataServer_->port()} {
+      metadataEndpoint_{"127.0.0.1", metadataServer_->port()},
+      metadataAddress_{metadataEndpoint_} {
 #if KILN_RDMA
   if (options.rdma) {
     try {
       rdmaMetadataServer_ = rdma::RdmaMetadataServer::start(metadata_, "", 0);
-      rdmaMetadataEndpoint_ = rdmaMetadataServer_->endpoint();
+      metadataAddress_.rdma = rdmaMetadataServer_->endpoint();
     } catch (const Error& e) {
       LOG(WARNING) << e.what() << "; metadata over TCP only";
     }

@@ -25,7 +25,7 @@ class RdmaMetadataServer {
 
   ~RdmaMetadataServer();
 
-  // Where clients reach it (ClientOptions::rdmaMetadata).
+  // Where clients reach it: the rdma:// URL of ClientOptions::metadata.
   const Endpoint& endpoint() const {
     return endpoint_;
   }

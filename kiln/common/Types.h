@@ -33,6 +33,29 @@ struct Endpoint {
   bool operator==(const Endpoint&) const = default;
 };
 
+// Where a metadata server is reached: over TCP, and over RDMA if it serves
+// the metadata calls there too (kiln_meta --rdma). Written as a comma
+// separated list of URLs, "tcp://host:port,rdma://host:port", in any order;
+// a bare "host:port" is a tcp:// URL. The rdma:// host must be an address
+// on the server's RDMA interface.
+struct MetadataAddress {
+  std::optional<Endpoint> tcp;
+  std::optional<Endpoint> rdma;
+
+  MetadataAddress() = default;
+
+  // Just TCP.
+  MetadataAddress(Endpoint endpoint) : tcp{std::move(endpoint)} {}
+
+  std::string toString() const;
+
+  // Throws Error(kInvalidArgument) if malformed, empty, or with a scheme
+  // twice.
+  static MetadataAddress parse(const std::string& urls);
+
+  bool operator==(const MetadataAddress&) const = default;
+};
+
 // This machine's host name, as other hosts should reach it.
 std::string localHostName();
 

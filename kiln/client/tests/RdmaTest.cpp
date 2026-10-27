@@ -69,11 +69,10 @@ class RdmaTest : public testing::Test {
     if (cluster_ == nullptr) {
       GTEST_SKIP() << "No RDMA device";
     }
-    // Without shared memory, so that RDMA is used on this one host.
+    // Without shared memory, so that RDMA is used on this one host; the
+    // metadata calls over TCP (only a tcp:// URL).
     client_ = std::make_unique<Client>(ClientOptions{
-        .metadata = cluster_->metadataEndpoint(),
-        .useShm = false,
-        .useRdma = true});
+        .metadata = cluster_->metadataEndpoint(), .useShm = false});
   }
 
   // Writes 'data' as one chunk from 'buffer', appended in pieces.
@@ -90,6 +89,22 @@ class RdmaTest : public testing::Test {
       buffer = blockingWait(writer->co_append(std::move(buffer)));
     }
     return blockingWait(writer->co_commit());
+  }
+
+  // Writes 'data' as one chunk with 'client' and reads it back; returns the
+  // bytes that went over RDMA.
+  static uint64_t writeRead(Client& client, const std::vector<uint8_t>& data) {
+    const auto before = client.stats().rdmaBytes;
+    auto writer = blockingWait(client.co_create());
+    auto buffer = client.allocateBuffer(data.size());
+    std::memcpy(buffer.data(), data.data(), data.size());
+    buffer.setSize(data.size());
+    blockingWait(writer->co_append(std::move(buffer)));
+    const auto id = blockingWait(writer->co_commit());
+    auto read = blockingWait(client.co_read(
+        id, 0, data.size(), client.allocateBuffer(data.size())));
+    EXPECT_EQ(std::memcmp(read.data(), data.data(), data.size()), 0);
+    return client.stats().rdmaBytes - before;
   }
 
   // The region as its storage server registered it.
@@ -193,12 +208,11 @@ TEST_F(RdmaTest, readsLocalFsOverTcp) {
 // The whole client with the metadata calls over RDMA too: nothing goes over
 // TCP but the storage servers' registrations.
 TEST_F(RdmaTest, makesMetadataCallsOverRdma) {
-  ASSERT_TRUE(cluster_->rdmaMetadataEndpoint());
+  ASSERT_TRUE(cluster_->metadataAddress().rdma);
   client_ = std::make_unique<Client>(ClientOptions{
-      .metadata = cluster_->metadataEndpoint(),
-      .useShm = false,
-      .useRdma = true,
-      .rdmaMetadata = cluster_->rdmaMetadataEndpoint()});
+      .metadata = cluster_->metadataAddress(), .useShm = false});
+  EXPECT_TRUE(client_->stats().rdmaMetadata);
+  EXPECT_TRUE(client_->stats().rdmaData);
   const auto data = pattern((4 << 20) + 3, 6);
   const auto id = put(
       data,
@@ -220,6 +234,85 @@ TEST_F(RdmaTest, makesMetadataCallsOverRdma) {
   ASSERT_EQ(refs.size(), 40);
   EXPECT_EQ(refs.back().name, "rdma/39");
   EXPECT_TRUE(blockingWait(client_->co_remove(id)));
+}
+
+// Which way the metadata calls and the data go, by the URLs and switches.
+TEST_F(RdmaTest, choosesTransports) {
+  const auto data = pattern(2 << 20, 7);
+  auto roundTrip = [&](Client& client) { return writeRead(client, data); };
+  const auto tcp = *cluster_->metadataAddress().tcp;
+  const auto rdma = *cluster_->metadataAddress().rdma;
+
+  // tcp:// only: metadata over TCP, data over RDMA.
+  Client tcpMetadata(ClientOptions{.metadata = tcp, .useShm = false});
+  EXPECT_FALSE(tcpMetadata.stats().rdmaMetadata);
+  EXPECT_TRUE(tcpMetadata.stats().rdmaData);
+  EXPECT_EQ(roundTrip(tcpMetadata), 2 * data.size());
+
+  // rdma:// only works too.
+  MetadataAddress rdmaOnly;
+  rdmaOnly.rdma = rdma;
+  Client rdmaMetadata(ClientOptions{.metadata = rdmaOnly, .useShm = false});
+  EXPECT_TRUE(rdmaMetadata.stats().rdmaMetadata);
+  EXPECT_EQ(roundTrip(rdmaMetadata), 2 * data.size());
+
+  // --meta_force_tcp: the rdma:// URL is not used.
+  Client metaForceTcp(ClientOptions{
+      .metadata = cluster_->metadataAddress(),
+      .metaForceTcp = true,
+      .useShm = false});
+  EXPECT_FALSE(metaForceTcp.stats().rdmaMetadata);
+  EXPECT_TRUE(metaForceTcp.stats().rdmaData);
+  EXPECT_EQ(roundTrip(metaForceTcp), 2 * data.size());
+  try {
+    Client none(ClientOptions{.metadata = rdmaOnly, .metaForceTcp = true});
+    FAIL() << "No usable metadata URL";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kInvalidArgument);
+  }
+
+  // --data_force_tcp: no RDMA (and no shared memory) for data.
+  Client dataForceTcp(ClientOptions{
+      .metadata = cluster_->metadataAddress(), .dataForceTcp = true});
+  EXPECT_TRUE(dataForceTcp.stats().rdmaMetadata);
+  EXPECT_FALSE(dataForceTcp.stats().rdmaData);
+  EXPECT_EQ(roundTrip(dataForceTcp), 0);
+
+  // With shared memory, regions on this host are mapped instead.
+  Client shm(ClientOptions{.metadata = cluster_->metadataAddress()});
+  EXPECT_EQ(roundTrip(shm), 0);
+}
+
+// An rdma:// URL nobody answers at fails the calls; they do not go over TCP
+// instead.
+TEST_F(RdmaTest, doesNotFallBackToTcp) {
+  auto address = cluster_->metadataAddress();
+  address.rdma->port = address.tcp->port;
+  Client client(ClientOptions{.metadata = address});
+  ASSERT_TRUE(client.stats().rdmaMetadata);
+  try {
+    blockingWait(client.co_getRef("a"));
+    FAIL() << "Reached the metadata server";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kUnavailable);
+  }
+}
+
+// A cluster whose servers serve TCP only: everything goes over TCP.
+TEST_F(RdmaTest, usesTcpWithServersWithoutRdma) {
+  local::LocalCluster tcpCluster(local::LocalClusterOptions{
+      .dramServers = 1,
+      .localFsServers = 0,
+      .regionSize = 16 << 20});
+  EXPECT_FALSE(tcpCluster.metadataAddress().rdma);
+  for (const auto& region : tcpCluster.servers()[0]->regions()) {
+    EXPECT_FALSE(region.rdma);
+  }
+  Client client(ClientOptions{
+      .metadata = tcpCluster.metadataAddress(), .useShm = false});
+  EXPECT_FALSE(client.stats().rdmaMetadata);
+  EXPECT_TRUE(client.stats().rdmaData);
+  EXPECT_EQ(writeRead(client, pattern(1 << 20, 8)), 0);
 }
 
 // Against the transport itself, which can be given broken RdmaAccess: a

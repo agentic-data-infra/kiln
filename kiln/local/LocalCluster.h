@@ -45,15 +45,15 @@ class LocalCluster {
 
   ~LocalCluster();
 
-  // The metadata server, for ClientOptions::metadata.
+  // The metadata server's TCP endpoint, as storage servers reach it.
   const Endpoint& metadataEndpoint() const {
     return metadataEndpoint_;
   }
 
-  // The metadata server's RDMA endpoint, for ClientOptions::rdmaMetadata;
-  // unset without the rdma option, an RDMA build or an RDMA device.
-  const std::optional<Endpoint>& rdmaMetadataEndpoint() const {
-    return rdmaMetadataEndpoint_;
+  // The metadata server's URLs, for ClientOptions::metadata: TCP, and RDMA
+  // with the rdma option in an RDMA build on a host with an RDMA device.
+  const MetadataAddress& metadataAddress() const {
+    return metadataAddress_;
   }
 
   // The metadata server's state, e.g. to check free blocks in tests.
@@ -70,7 +70,7 @@ class LocalCluster {
   std::unique_ptr<rpc::RpcServer> metadataServer_;
   Endpoint metadataEndpoint_;
   std::unique_ptr<rdma::RdmaMetadataServer> rdmaMetadataServer_;
-  std::optional<Endpoint> rdmaMetadataEndpoint_;
+  MetadataAddress metadataAddress_;
   std::vector<std::unique_ptr<server::StorageServer>> servers_;
 };
 

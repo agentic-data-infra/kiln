@@ -6,6 +6,7 @@
 
 #include <fmt/format.h>
 #include <folly/Conv.h>
+#include <folly/String.h>
 
 #include "kiln/common/Error.h"
 
@@ -37,6 +38,44 @@ Endpoint Endpoint::parse(const std::string& endpoint) {
         fmt::format("Bad port in '{}'", endpoint));
   }
   return Endpoint{std::move(host), *port};
+}
+
+std::string MetadataAddress::toString() const {
+  std::string urls;
+  if (tcp) {
+    urls = "tcp://" + tcp->toString();
+  }
+  if (rdma) {
+    urls += (urls.empty() ? "rdma://" : ",rdma://") + rdma->toString();
+  }
+  return urls;
+}
+
+MetadataAddress MetadataAddress::parse(const std::string& urls) {
+  MetadataAddress address;
+  std::vector<folly::StringPiece> parts;
+  folly::split(',', urls, parts);
+  for (auto part : parts) {
+    auto url = folly::trimWhitespace(part);
+    auto* endpoint = &address.tcp;
+    if (url.removePrefix("rdma://")) {
+      endpoint = &address.rdma;
+    } else {
+      url.removePrefix("tcp://");
+    }
+    if (url.find("://") != folly::StringPiece::npos) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("Expected a tcp:// or rdma:// URL, got '{}'", part));
+    }
+    if (*endpoint) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("Two URLs of one scheme in '{}'", urls));
+    }
+    *endpoint = Endpoint::parse(url.str());
+  }
+  return address;
 }
 
 std::string localHostName() {

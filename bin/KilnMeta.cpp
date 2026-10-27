@@ -6,8 +6,8 @@
 // Storage servers register their regions here, and clients ask it for blocks
 // and where chunks are, and for refs. Its state is in memory; with a journal,
 // refs survive restarts. With --rdma (in a -c kiln.rdma=true build) it also
-// answers over RDMA, at the address and port it logs, for clients with
-// ClientOptions::rdmaMetadata. Stops on SIGINT or SIGTERM.
+// answers over RDMA. It logs its URLs, e.g. tcp://host:7470,rdma://addr:7471,
+// for clients (kiln --metadata). Stops on SIGINT or SIGTERM.
 
 #include <folly/init/Init.h>
 #include <gflags/gflags.h>
@@ -46,7 +46,9 @@ int main(int argc, char** argv) {
           .journal = FLAGS_journal});
   auto server = kiln::rpc::serveMetadata(
       metadata, FLAGS_bind_host, static_cast<uint16_t>(FLAGS_port));
-  LOG(INFO) << "Metadata server on port " << server->port();
+  kiln::MetadataAddress address(kiln::Endpoint{
+      .host = FLAGS_bind_host.empty() ? kiln::localHostName() : FLAGS_bind_host,
+      .port = server->port()});
 #if KILN_RDMA
   std::unique_ptr<kiln::rdma::RdmaMetadataServer> rdmaServer;
   if (FLAGS_rdma) {
@@ -57,8 +59,7 @@ int main(int argc, char** argv) {
       LOG(ERROR) << e.what();
       return 1;
     }
-    LOG(INFO) << "Metadata server on RDMA at "
-              << rdmaServer->endpoint().toString();
+    address.rdma = rdmaServer->endpoint();
   }
 #else
   if (FLAGS_rdma) {
@@ -66,6 +67,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 #endif
+  // For clients' ClientOptions::metadata (kiln --metadata).
+  LOG(INFO) << "Metadata server at " << address.toString();
 
   const int signal = kiln::waitForStopSignal(signals);
   LOG(INFO) << "Stopping on signal " << signal;
