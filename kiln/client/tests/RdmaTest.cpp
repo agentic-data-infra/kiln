@@ -3,12 +3,15 @@
 // from rlib's scripts/setup-rxe.sh).
 
 #include <cstring>
+#include <functional>
+#include <stdexcept>
 #include <vector>
 
 #include <folly/coro/BlockingWait.h>
 #include <gtest/gtest.h>
 
 #include "kiln/client/Client.h"
+#include "kiln/client/RdmaTransport.h"
 #include "kiln/common/Error.h"
 #include "kiln/local/LocalCluster.h"
 #include "kiln/rdma/Device.h"
@@ -86,6 +89,18 @@ class RdmaTest : public testing::Test {
       buffer = blockingWait(writer->co_append(std::move(buffer)));
     }
     return blockingWait(writer->co_commit());
+  }
+
+  // The region as its storage server registered it.
+  static RegionInfo region(RegionId id) {
+    for (const auto& server : cluster_->servers()) {
+      for (const auto& region : server->regions()) {
+        if (region.id == id) {
+          return region;
+        }
+      }
+    }
+    throw std::out_of_range("No such region");
   }
 
   static local::LocalCluster* cluster_;
@@ -172,6 +187,92 @@ TEST_F(RdmaTest, readsLocalFsOverTcp) {
       id, 0, data.size(), client_->allocateBuffer(data.size())));
   EXPECT_EQ(std::memcmp(read.data(), data.data(), data.size()), 0);
   EXPECT_EQ(client_->stats().rdmaBytes, 0);
+}
+
+// Against the transport itself, which can be given broken RdmaAccess: a
+// failed operation fails with kUnavailable, and the next one connects again.
+class RdmaTransportTest : public RdmaTest {
+ protected:
+  void SetUp() override {
+    RdmaTest::SetUp();
+    if (IsSkipped()) {
+      return;
+    }
+    const auto id = put(data_, client_->allocateBuffer(1 << 20));
+    block_ = blockingWait(client_->co_stat(id)).replicas[0].blocks[0];
+    region_ = region(block_.region);
+    memory_ = std::make_shared<RdmaMemory>(rdma::Device::open());
+    stats_ = std::make_shared<RdmaStats>();
+    transport_ = makeRdmaTransport(memory_, stats_);
+    buffer_ = Buffer::allocate(block_.length);
+    buffer_.setRegistration(
+        memory_->registerMemory(buffer_.data(), block_.length));
+  }
+
+  void read(const RegionInfo& region) {
+    std::memset(buffer_.data(), 0, block_.length);
+    blockingWait(transport_->co_read(
+        region,
+        block_.offset,
+        folly::MutableByteRange(buffer_.data(), block_.length)));
+  }
+
+  void write(const RegionInfo& region) {
+    std::memcpy(buffer_.data(), data_.data(), block_.length);
+    blockingWait(transport_->co_write(
+        region, block_.offset, folly::ByteRange(buffer_.data(), block_.length)));
+  }
+
+  bool readsTheBlock() {
+    return std::memcmp(buffer_.data(), data_.data(), block_.length) == 0;
+  }
+
+  void expectUnavailable(std::function<void()> call) {
+    try {
+      call();
+      FAIL() << "Expected kUnavailable";
+    } catch (const Error& e) {
+      EXPECT_EQ(e.code(), ErrorCode::kUnavailable) << e.what();
+    }
+  }
+
+  const std::vector<uint8_t> data_ = pattern(1 << 20, 5);
+  BlockRef block_;
+  RegionInfo region_;
+  std::shared_ptr<RdmaMemory> memory_;
+  std::shared_ptr<RdmaStats> stats_;
+  std::unique_ptr<Transport> transport_;
+  Buffer buffer_;
+};
+
+// A wrong key fails the operation, and with it the connection (its QP goes
+// into the error state); the next operations connect again.
+TEST_F(RdmaTransportTest, reconnectsAfterAFailedOperation) {
+  read(region_);
+  EXPECT_TRUE(readsTheBlock());
+
+  auto wrongKey = region_;
+  wrongKey.rdma->rkey += 1;
+  expectUnavailable([&] { read(wrongKey); });
+  read(region_);
+  EXPECT_TRUE(readsTheBlock());
+
+  expectUnavailable([&] { write(wrongKey); });
+  write(region_);
+  read(region_);
+  EXPECT_TRUE(readsTheBlock());
+  EXPECT_EQ(stats_->bounced, 0);
+}
+
+// A server that cannot be reached fails the operation; reaching it again
+// works.
+TEST_F(RdmaTransportTest, failsToConnectToNoServer) {
+  auto noServer = region_;
+  // Nothing listens on the TCP port in RDMA's port space.
+  noServer.rdma->endpoint.port = region_.tcp->endpoint.port;
+  expectUnavailable([&] { read(noServer); });
+  read(region_);
+  EXPECT_TRUE(readsTheBlock());
 }
 
 // Clients outlive their buffers and buffers their clients.

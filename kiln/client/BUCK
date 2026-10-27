@@ -1,16 +1,28 @@
 load("//kiln:options.bzl", "KILN_RDMA")
 
+# How the client moves bytes to and from regions; internal to the client
+# and its tests.
+cxx_library(
+    name = "transport",
+    # The RDMA transport only with -c kiln.rdma=true.
+    srcs = ["Transport.cpp"] + (["RdmaTransport.cpp"] if KILN_RDMA else []),
+    header_namespace = "kiln/client",
+    exported_headers = ["Transport.h"] + (["RdmaTransport.h"] if KILN_RDMA else []),
+    exported_deps = ["//kiln/common:common"] + (["//kiln/rdma:rdma"] if KILN_RDMA else []),
+    deps = ["//kiln/rpc:rpc"],
+    visibility = ["//kiln/client/..."],
+)
+
 cxx_library(
     name = "client",
-    # The RDMA transport only with -c kiln.rdma=true.
-    srcs = glob(["*.cpp"], exclude = [] if KILN_RDMA else ["Rdma*.cpp"]),
+    srcs = ["Client.cpp"],
     header_namespace = "kiln/client",
     exported_headers = ["Client.h"],
-    headers = ["Transport.h"] + (["RdmaTransport.h"] if KILN_RDMA else []),
     exported_deps = ["//kiln/common:common"],
     deps = [
+        ":transport",
         "//kiln/objectstore:objectstore",
         "//kiln/rpc:rpc",
-    ] + (["//kiln/rdma:rdma"] if KILN_RDMA else []),
+    ],
     visibility = ["PUBLIC"],
 )

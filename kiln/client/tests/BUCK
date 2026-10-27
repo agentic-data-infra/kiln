@@ -41,6 +41,7 @@ KILN_RDMA and cxx_test(
     srcs = ["RdmaTest.cpp"],
     deps = [
         "//kiln/client:client",
+        "//kiln/client:transport",
         "//kiln/local:local",
         "//kiln/rdma:rdma",
         "//kiln/tests:test_main",
