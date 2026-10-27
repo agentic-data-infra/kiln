@@ -21,6 +21,7 @@ class RpcServer;
 namespace kiln::server {
 
 class RegionStore;
+class RdmaRegionServer;
 
 struct StorageServerOptions {
   // The metadata server to register with.
@@ -48,6 +49,13 @@ struct StorageServerOptions {
   // How often to register again, so that a restarted metadata server learns
   // of the regions.
   std::chrono::milliseconds registerInterval{std::chrono::seconds(5)};
+  // Also serve DRAM regions for one-sided RDMA (RdmaAccess), on the RDMA
+  // device of 'rdmaHost' (empty for the first interface that has one). Needs
+  // a build with -c kiln.rdma=true, a device, and a locked memory limit
+  // (ulimit -l) that fits the regions; without them the server serves TCP
+  // only, with a warning. Local-FS regions are served over TCP only.
+  bool rdma{false};
+  std::string rdmaHost;
 };
 
 // A storage server: holds the blocks of one tier in its regions and serves
@@ -90,6 +98,8 @@ class StorageServer {
   std::condition_variable stop_;
   bool stopping_{false};
   std::shared_ptr<RegionStore> store_;
+  // Set if serving RDMA; goes before the regions.
+  std::unique_ptr<RdmaRegionServer> rdma_;
   std::unique_ptr<rpc::RpcServer> rpcServer_;
   Endpoint endpoint_;
   std::vector<RegionInfo> regions_;

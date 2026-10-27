@@ -1,10 +1,12 @@
 // Write and read throughput of one chunk over TCP and over shared memory, in
-// each tier, next to reading and writing a plain local file.
+// each tier, and, built with -c kiln.rdma=true, over RDMA for DRAM; next to
+// reading and writing a plain local file.
 //
 //   transport_benchmark [--size_mb=N] [--rounds=R] [--piece_mb=P]
 //
 // Runs against a cluster in this process (on 127.0.0.1), so TCP goes through
-// the loopback device.
+// the loopback device. RDMA goes through the first RDMA device, e.g.
+// Soft-RoCE's rxe0, on its interface's address.
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -18,6 +20,7 @@
 #include <gflags/gflags.h>
 
 #include "kiln/client/Client.h"
+#include "kiln/common/Error.h"
 #include "kiln/local/LocalCluster.h"
 
 DEFINE_int64(size_mb, 256, "Chunk size in MiB.");
@@ -117,7 +120,8 @@ int main(int argc, char** argv) {
       .localFsServers = 2,
       .regionSize = regionSize,
       .metadata = meta::MetadataOptions{
-          .gracePeriod = std::chrono::milliseconds(0)}});
+          .gracePeriod = std::chrono::milliseconds(0)},
+      .rdma = KILN_RDMA == 1});
 
   fmt::print(
       "{} MiB chunk, appended in {} MiB pieces, read {} times\n",
@@ -131,6 +135,17 @@ int main(int argc, char** argv) {
       folly::coro::blockingWait(co_measure(client, tier, shm ? "shm" : "tcp"));
     }
   }
+#if KILN_RDMA
+  try {
+    client::Client client(client::ClientOptions{
+        .metadata = cluster.metadataEndpoint(),
+        .useShm = false,
+        .useRdma = true});
+    folly::coro::blockingWait(co_measure(client, Tier::kDram, "rdma"));
+  } catch (const Error& e) {
+    fmt::print("No RDMA: {}\n", e.what());
+  }
+#endif
   measureLocalFile();
   return 0;
 }

@@ -26,6 +26,8 @@ class ObjectStore;
 namespace kiln::client {
 
 class Transport;
+class RdmaMemory;
+struct RdmaStats;
 
 struct ClientOptions {
   // The metadata server.
@@ -41,6 +43,21 @@ struct ClientOptions {
   // The deployment's object store, to write chunks through to it and read
   // their copies there; none if unset.
   std::shared_ptr<objectstore::ObjectStore> objectStore;
+  // Reach regions with RdmaAccess with one-sided RDMA (after shared memory,
+  // before TCP), on the RDMA device of 'rdmaHost' (empty for the first
+  // interface that has one). Data then moves straight between the storage
+  // servers and buffers from allocateBuffer or registerMemory; other memory
+  // goes through a copy. Needs a build with -c kiln.rdma=true.
+  bool useRdma{false};
+  std::string rdmaHost;
+};
+
+struct ClientStats {
+  // Bytes moved with RDMA straight from and to registered buffers.
+  uint64_t rdmaBytes{0};
+  // Bytes moved with RDMA through a copy, as the caller's memory was not
+  // registered.
+  uint64_t rdmaCopiedBytes{0};
 };
 
 class ChunkWriter;
@@ -59,12 +76,17 @@ class Client {
   Client(const Client&) = delete;
   Client& operator=(const Client&) = delete;
 
-  // Memory to write chunks from and read them into.
+  // Memory to write chunks from and read them into; with RDMA, registered
+  // with the NIC until the buffer goes. Registering takes time: keep buffers
+  // and reuse them.
   Buffer allocateBuffer(size_t capacity);
 
-  // The caller's 'length' bytes at 'data' as a Buffer; the caller keeps them
-  // alive while the buffer is in use.
+  // The caller's 'length' bytes at 'data' as a Buffer, registered like
+  // allocateBuffer's; the caller keeps them alive while the buffer is in
+  // use.
   Buffer registerMemory(void* data, size_t length);
+
+  ClientStats stats() const;
 
   // Starts a new chunk in the placement's tier, and its write-through
   // tier if set.
@@ -132,6 +154,10 @@ class Client {
   const std::shared_ptr<rpc::MetadataRpc> metadata_;
   const std::unique_ptr<Transport> tcp_;
   const std::unique_ptr<Transport> shm_;
+  // Set with useRdma.
+  std::shared_ptr<RdmaMemory> rdmaMemory_;
+  std::shared_ptr<RdmaStats> rdmaStats_;
+  std::unique_ptr<Transport> rdma_;
 
   std::mutex mutex_;
   std::unordered_map<RegionId, RegionInfo> regions_;

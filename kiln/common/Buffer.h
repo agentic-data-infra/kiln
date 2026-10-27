@@ -12,8 +12,9 @@ namespace kiln {
 // Contiguous memory that chunk data is written from and read into: 'size'
 // bytes of data in 'capacity' bytes of memory. Clients get one from
 // Client::allocateBuffer or wrap their own memory with
-// Client::registerMemory; with RDMA (later) both are registered with the NIC
-// so that storage servers' NICs can reach them. Move only.
+// Client::registerMemory; with the RDMA transport both are registered with
+// the NIC, so that chunk data moves straight between them and the storage
+// servers. Move only.
 class Buffer {
  public:
   Buffer() = default;
@@ -26,7 +27,13 @@ class Buffer {
   static Buffer wrap(void* data, size_t capacity);
 
   Buffer(Buffer&&) noexcept = default;
-  Buffer& operator=(Buffer&&) noexcept = default;
+  Buffer& operator=(Buffer&& other) noexcept;
+
+  // Keeps 'registration' (e.g. of the memory with the NIC) as long as the
+  // buffer, and releases it before the memory.
+  void setRegistration(std::shared_ptr<void> registration) {
+    registration_ = std::move(registration);
+  }
 
   uint8_t* data() {
     return data_;
@@ -59,6 +66,8 @@ class Buffer {
   };
 
   std::unique_ptr<uint8_t, Free> owned_;
+  // Declared after owned_, so destroyed before it.
+  std::shared_ptr<void> registration_;
   uint8_t* data_{nullptr};
   size_t size_{0};
   size_t capacity_{0};

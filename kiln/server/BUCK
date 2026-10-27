@@ -1,8 +1,11 @@
+load("//kiln:options.bzl", "KILN_RDMA")
+
 cxx_library(
     name = "server",
-    srcs = glob(["*.cpp"]),
+    # RdmaRegionServer only with -c kiln.rdma=true.
+    srcs = glob(["*.cpp"], exclude = [] if KILN_RDMA else ["Rdma*.cpp"]),
     header_namespace = "kiln/server",
-    exported_headers = glob(["*.h"]),
-    exported_deps = ["//kiln/rpc:rpc"],
+    exported_headers = glob(["*.h"], exclude = [] if KILN_RDMA else ["Rdma*.h"]),
+    exported_deps = ["//kiln/rpc:rpc"] + (["//kiln/rdma:rdma"] if KILN_RDMA else []),
     visibility = ["PUBLIC"],
 )

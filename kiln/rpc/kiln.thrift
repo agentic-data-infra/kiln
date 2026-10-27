@@ -51,6 +51,7 @@ struct ShmAccess {
 
 struct RdmaAccess {
   1: Endpoint endpoint;
+  /// A u32; i64 as thrift has no unsigned types.
   2: i64 rkey;
   3: i64 baseAddress;
 }

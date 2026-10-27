@@ -6,7 +6,7 @@ designed to be used by AI agents. Storage servers hold
 blocks (1 MiB) inside large regions (1 GiB) of memory or local files; a
 metadata server knows the regions and which blocks make up each chunk; and
 clients read and write the blocks directly at the servers, at (region,
-offset, length), so that with RDMA (later) servers spend no CPU on data. On
+offset, length), so that with RDMA servers spend no CPU on data. On
 top of the chunks come refs, names that point at chunks, and a git-style
 catalog, so agents that explore data in many small, overlapping experiments
 can share and reuse results instead of copying them.
@@ -19,8 +19,9 @@ are `folly::coro::Task` based.
 
 Today Kiln has the metadata server; DRAM and local-FS storage servers; an
 object store interface (`kiln/objectstore`) with a local-directory backend;
-and the client, which reaches regions over TCP or, on the same host, by
-mapping their files. Tiers fill up to the storage servers' byte budgets and
+and the client, which reaches regions over TCP, with one-sided RDMA (DRAM
+regions, in a build with RDMA), or, on the same host, by mapping their
+files. Tiers fill up to the storage servers' byte budgets and
 then evict their least recently used chunks. Chunks can be written through
 to a durable tier, and refs and written-through chunks survive restarts.
 The catalog keeps memos of results (below).
@@ -52,6 +53,32 @@ seconds, so a restarted metadata server learns of them. Until a chunk's
 storage server has registered again, the chunk reads as `kUnavailable`.
 Chunks that are not written through, and all of DRAM, are gone after a
 restart. Objects of removed chunks stay in the object store for now.
+
+## RDMA
+
+Built with `-c kiln.rdma=true` (see Building), DRAM storage servers started
+with `--rdma` register their regions with the NIC and publish each region's
+address and key in its `RegionInfo` (`RdmaAccess`). Clients with
+`ClientOptions::useRdma` then read and write blocks with one-sided RDMA
+reads and writes: the storage server's CPU does no work for them, and the
+bytes move straight between the region and the caller's buffer, with no
+copy on either side. For that the buffer must be registered with the NIC
+too: buffers from `Client::allocateBuffer` and `Client::registerMemory` are,
+until they go. Registering takes time, so keep a pool of buffers and reuse
+them. Other memory works, but goes through a copy (counted in
+`Client::stats()`, with a warning).
+
+```cpp
+kiln::client::Client client({.metadata = metadata, .useRdma = true});
+auto buffer = client.allocateBuffer(64 << 20);    // registered once
+buffer = co_await client.co_read(id, 0, 64 << 20, std::move(buffer));
+```
+
+Clients use shared memory for servers on their own host, then RDMA, then
+TCP. Local-FS regions are served over TCP only. A storage server whose
+locked memory limit (`ulimit -l`) does not fit its regions, or that has no
+RDMA device, serves TCP only, with a warning. The metadata calls still go
+over TCP.
 
 ## Refs
 
@@ -138,6 +165,7 @@ kiln --write_through=localfs put some/file
 kiln --object_store=/some/dir --write_through=objectstore put some/file
 kiln stat $id
 kiln get $id copy                       # --tcp_only to skip shared memory
+kiln --rdma --tcp_only get $id copy     # RDMA, with kiln_server --rdma
 kiln rm $id
 kiln ref set head $id                   # prints the ref's version
 kiln ref set head $other_id VERSION     # only if head is still at VERSION
@@ -168,6 +196,14 @@ TCP over loopback, it measured:
 | local FS| shm       | 1.9 GB/s | 5.0 GB/s |
 | plain local file (pwrite/pread) | | 2.7 GB/s | 3.9 GB/s |
 
+Built with RDMA, it also measures DRAM over RDMA. Soft-RoCE (rxe0 on the same
+VM, where perftest's `ib_read_bw` and `ib_write_bw` get 0.62 and 0.87 GB/s)
+runs RDMA in the kernel, so it says little about a real NIC:
+
+| tier | transport | write    | read     |
+|------|-----------|----------|----------|
+| DRAM | RDMA (rxe)| 0.8 GB/s | 0.87 GB/s |
+
 ## Layout
 
 - `kiln/common`: chunk ids, buffers, the metadata types (`Types.h`), errors.
@@ -179,7 +215,8 @@ TCP over loopback, it measured:
 - `kiln/server`: the storage server and its regions.
 - `kiln/client`: the client library and its transports.
 - `kiln/rdma`: RDMA support on rlib (with `kiln.rdma`): the device and
-  memory registration.
+  memory registration. The RDMA transport is in `kiln/client`, the serving
+  of regions in `kiln/server`.
 - `kiln/local`: a whole cluster in one process, for tests, examples and
   benchmarks.
 - `kiln/catalog`: the catalog's memos, on the public client API.
