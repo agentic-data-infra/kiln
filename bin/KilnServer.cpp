@@ -3,14 +3,15 @@
 //   kiln_server --metadata=URLS [--tier=dram|localfs] [--regions=N]
 //               [--region_size_mb=M] [--budget_mb=B] [--dir=D] [--port=P]
 //               [--host=name]
-//               [--bind_host=name]
+//               [--bind_host=name] [--rdma [--rdma_host=addr]]
 //
 // Creates its regions (files in /dev/shm for DRAM, preallocated files for
 // the local FS), registers them with the metadata server, retrying until it
 // is up and again every few seconds, and serves them. Stops on SIGINT or
 // SIGTERM. A DRAM server's data is gone then; a local-FS server with --dir
 // keeps its region files there and reattaches them, with their data, when it
-// starts again.
+// starts again. With --rdma (in a -c kiln.rdma=true build) DRAM regions are
+// also served over RDMA.
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/init/Init.h>

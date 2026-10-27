@@ -56,48 +56,98 @@ restart. Objects of removed chunks stay in the object store for now.
 
 ## RDMA
 
-Built with `-c kiln.rdma=true` (see Building), DRAM storage servers started
-with `--rdma` register their regions with the NIC and publish each region's
-address and key in its `RegionInfo` (`RdmaAccess`). Clients built with
-RDMA and with an RDMA device then read and write those regions' blocks with
-one-sided RDMA reads and writes: the storage server's CPU does no work for them, and the
-bytes move straight between the region and the caller's buffer, with no
-copy on either side. For that the buffer must be registered with the NIC
-too: buffers from `Client::allocateBuffer` and `Client::registerMemory` are,
-until they go. Registering takes time, so keep a pool of buffers and reuse
-them. Other memory works, but goes through a copy (counted in
-`Client::stats()`, with a warning).
+Kiln can move data and metadata calls over RDMA, on
+[rlib](https://github.com/agentic-data-infra/rlib). Data uses one-sided
+RDMA reads and writes, so the storage server's CPU does no work for them and
+the bytes go straight between the region and the caller's buffer, with no
+copy on either side. Metadata calls use rlib's RPC. Servers always serve TCP
+and add RDMA when asked; each client chooses what to use.
+
+### Building
+
+RDMA is a build option: `-c kiln.rdma=true`, after linking an rlib checkout
+with `scripts/link_rlib.sh` (see Building). In a build without it,
+`kiln_meta --rdma` fails to start, storage servers serve TCP only with a
+warning, and clients use TCP.
+
+### Servers
+
+- `kiln_meta --rdma` also answers metadata calls over RDMA (`--rdma_port`,
+  7471 by default) and logs its URLs, e.g.
+  `tcp://meta:7470,rdma://10.0.0.1:7471`. It fails to start if it cannot
+  serve RDMA.
+- `kiln_server --rdma` registers its DRAM regions with the NIC and publishes
+  each region's address and key in its `RegionInfo` (`RdmaAccess`).
+  Local-FS regions are served over TCP only.
+- Both serve RDMA on the first interface with an RDMA device, or on
+  `--rdma_host`.
+- Registering memory pins it, up to the locked memory limit (`ulimit -l`).
+  A storage server whose limit does not fit its regions, or that has no RDMA
+  device, serves TCP only, with a warning.
+- Storage servers register with the metadata server over TCP;
+  `kiln_server --metadata` takes the same URL list as clients.
+
+### Clients
+
+`ClientOptions::metadata` (`kiln --metadata`) is the URL list `kiln_meta`
+logs. A bare `host:port` means `tcp://`.
+
+- **Metadata calls:** if the client has an RDMA device and the list has an
+  `rdma://` URL, all metadata calls go there; otherwise they go to the
+  `tcp://` URL. If neither is usable, creating the client fails with
+  `kInvalidArgument`. The choice is made once, when the client is created:
+  if the RDMA metadata server cannot be reached later, calls fail with
+  `kUnavailable` rather than go over TCP.
+- **Data,** region by region: shared memory for servers on the client's own
+  host, then RDMA if the region offers it and the client has an RDMA
+  device, then TCP.
+
+Switches:
+
+| option | `kiln` flag | effect |
+|---|---|---|
+| `metaForceTcp` | `--meta_force_tcp` | metadata calls over TCP, even with an `rdma://` URL |
+| `dataForceTcp` | `--data_force_tcp` | data over TCP only: no RDMA, no shared memory |
+| `useShm = false` | `--no_shm` | no shared memory, so that RDMA is used on one host too |
+
+`Client::stats()` tells what a client chose (`rdmaMetadata`, `rdmaData`)
+and how many bytes went over RDMA, straight from registered buffers
+(`rdmaBytes`) or through a copy (`rdmaCopiedBytes`).
+
+For zero copy, the buffer must be registered with the NIC too: buffers from
+`Client::allocateBuffer` and `Client::registerMemory` are, until they go.
+Registering takes time, so keep a pool of buffers and reuse them. Other
+memory works, but goes through a copy, with a warning.
 
 ```cpp
-kiln::client::Client client({.metadata = metadata});
-assert(client.stats().rdmaData);                  // has an RDMA device
+kiln::client::Client client({.metadata = kiln::MetadataAddress::parse(urls)});
 auto buffer = client.allocateBuffer(64 << 20);    // registered once
 buffer = co_await client.co_read(id, 0, 64 << 20, std::move(buffer));
 ```
 
-Clients use shared memory for servers on their own host, then RDMA, then
-TCP, region by region. `ClientOptions::useShm = false` (`kiln --no_shm`)
-skips shared memory, so that RDMA is used on one host too;
-`ClientOptions::dataForceTcp` (`kiln --data_force_tcp`) moves all data over
-TCP. Local-FS regions are served over TCP only. A storage server whose
-locked memory limit (`ulimit -l`) does not fit its regions, or that has no
-RDMA device, serves TCP only, with a warning.
+### A cluster on one machine
 
-The metadata calls can go over RDMA too, with rlib's RPC: `kiln_meta --rdma`
-also answers there (port 7471 by default, `--rdma_port`) and logs both
-URLs, e.g. `tcp://meta:7470,rdma://10.0.0.1:7471`. `ClientOptions::metadata`
-(`kiln --metadata`) takes that list (a bare `host:port` is `tcp://`). A
-client with an RDMA device and an `rdma://` URL makes all its metadata calls
-there, otherwise over `tcp://`; `ClientOptions::metaForceTcp`
-(`kiln --meta_force_tcp`) keeps them on TCP. The choice is made once, when
-the client is created: if the RDMA metadata server cannot be reached later,
-calls fail with `kUnavailable` rather than go over TCP. Storage servers
-keep registering over TCP, and take the same list (`kiln_server --metadata`).
-RDMA messages have a fixed size (64 KiB): a chunk takes about 12 bytes per
-block per copy, so chunks up to about 5 GiB fit (2.5 GiB written through
-to a second tier); calls whose request or response does not fit fail with
-`kTooLarge`. The client asks for refs (`co_listRefs`) and regions in pages
-that fit.
+`scripts/start_local_cluster.sh -R` builds with RDMA, starts `kiln_meta` and
+the storage servers with `--rdma`, and prints the URL list. Use
+`kiln --no_shm` with it, as otherwise shared memory is used on one host.
+`LocalClusterOptions::rdma` does the same for clusters in one process
+(`LocalCluster::metadataAddress()`).
+
+### Message size
+
+RDMA metadata messages have a fixed size of 64 KiB. A chunk takes about 12
+bytes per block per copy, so chunks up to about 5 GiB fit (2.5 GiB written
+through to a second tier). Calls whose request or response does not fit
+fail with `kTooLarge`. The client asks for refs (`co_listRefs`) and regions
+in pages that fit.
+
+### Soft-RoCE
+
+Without an RDMA NIC, rlib's `scripts/setup-rxe.sh` sets up Soft-RoCE (rxe)
+on an Ethernet interface; then everything above works, and the tests that
+need a device run instead of skipping. Soft-RoCE runs in the kernel and
+drops packets under load, so Kiln sets RDMA connections' retry counts to the
+maximum (7); its numbers in the benchmarks under Using it say little about a real NIC.
 
 ## Refs
 
@@ -294,9 +344,8 @@ scripts/link_rlib.sh                     # or scripts/link_rlib.sh <rlib dir>
 buck2 test -c kiln.rdma=true //...
 ```
 
-Tests that need an RDMA device skip themselves when there is none; without
-an RDMA NIC, run rlib's `scripts/setup-rxe.sh` for Soft-RoCE. Registering
-memory pins it, up to the locked memory limit (`ulimit -l`).
+Tests that need an RDMA device skip themselves when there is none; see
+RDMA for Soft-RoCE.
 
 Kiln needs GCC 12: GCC 11 miscompiles `co_await` inside coroutine templates
 with this folly, which rules out fbthrift's generated `co_*` clients. folly
