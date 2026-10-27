@@ -3,6 +3,17 @@
 #include <folly/coro/BlockingWait.h>
 
 #include "kiln/rpc/Rpc.h"
+#if KILN_RDMA
+#include <glog/logging.h>
+
+#include "kiln/common/Error.h"
+#include "kiln/rdma/RdmaMetadata.h"
+#else
+namespace kiln::rdma {
+// Never made without RDMA.
+class RdmaMetadataServer {};
+} // namespace kiln::rdma
+#endif
 
 namespace kiln::local {
 
@@ -10,6 +21,16 @@ LocalCluster::LocalCluster(LocalClusterOptions options)
     : metadata_{std::make_shared<meta::Metadata>(options.metadata)},
       metadataServer_{rpc::serveMetadata(metadata_, "127.0.0.1", 0)},
       metadataEndpoint_{"127.0.0.1", metadataServer_->port()} {
+#if KILN_RDMA
+  if (options.rdma) {
+    try {
+      rdmaMetadataServer_ = rdma::RdmaMetadataServer::start(metadata_, "", 0);
+      rdmaMetadataEndpoint_ = rdmaMetadataServer_->endpoint();
+    } catch (const Error& e) {
+      LOG(WARNING) << e.what() << "; metadata over TCP only";
+    }
+  }
+#endif
   auto start = [&](Tier tier, const std::string& dir) {
     servers_.push_back(folly::coro::blockingWait(
         server::StorageServer::co_start(server::StorageServerOptions{
@@ -33,6 +54,7 @@ LocalCluster::LocalCluster(LocalClusterOptions options)
 
 LocalCluster::~LocalCluster() {
   servers_.clear();
+  rdmaMetadataServer_.reset();
   metadataServer_.reset();
 }
 

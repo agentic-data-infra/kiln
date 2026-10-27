@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include <fmt/format.h>
 #include <folly/coro/BlockingWait.h>
 #include <gtest/gtest.h>
 
@@ -187,6 +188,38 @@ TEST_F(RdmaTest, readsLocalFsOverTcp) {
       id, 0, data.size(), client_->allocateBuffer(data.size())));
   EXPECT_EQ(std::memcmp(read.data(), data.data(), data.size()), 0);
   EXPECT_EQ(client_->stats().rdmaBytes, 0);
+}
+
+// The whole client with the metadata calls over RDMA too: nothing goes over
+// TCP but the storage servers' registrations.
+TEST_F(RdmaTest, makesMetadataCallsOverRdma) {
+  ASSERT_TRUE(cluster_->rdmaMetadataEndpoint());
+  client_ = std::make_unique<Client>(ClientOptions{
+      .metadata = cluster_->metadataEndpoint(),
+      .useShm = false,
+      .useRdma = true,
+      .rdmaMetadata = cluster_->rdmaMetadataEndpoint()});
+  const auto data = pattern((4 << 20) + 3, 6);
+  const auto id = put(
+      data,
+      client_->allocateBuffer(1 << 20),
+      Placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs});
+  const auto chunk = blockingWait(client_->co_stat(id));
+  ASSERT_EQ(chunk.replicas.size(), 2);
+  EXPECT_EQ(chunk.replicas[0].blocks.size(), 5);
+  auto read = blockingWait(client_->co_read(
+      id, 0, data.size(), client_->allocateBuffer(data.size())));
+  EXPECT_EQ(std::memcmp(read.data(), data.data(), data.size()), 0);
+
+  // More refs than fit one page.
+  for (int i = 0; i < 40; ++i) {
+    blockingWait(client_->co_casRef(
+        fmt::format("rdma/{:02}", i), std::nullopt, "value"));
+  }
+  const auto refs = blockingWait(client_->co_listRefs("rdma/"));
+  ASSERT_EQ(refs.size(), 40);
+  EXPECT_EQ(refs.back().name, "rdma/39");
+  EXPECT_TRUE(blockingWait(client_->co_remove(id)));
 }
 
 // Against the transport itself, which can be given broken RdmaAccess: a

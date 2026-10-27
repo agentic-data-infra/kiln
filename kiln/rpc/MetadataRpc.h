@@ -66,9 +66,13 @@ class MetadataRpc {
       std::optional<uint64_t> expectedVersion,
       std::string value) = 0;
 
-  // The refs whose names start with 'prefix', by name.
+  // Up to 'limit' (0 for all) refs whose names start with 'prefix' and come
+  // after 'startAfter' (empty for from the first), by name: to list many
+  // refs in pages, start each page after the last name of the one before.
   virtual folly::coro::Task<std::vector<Ref>> co_listRefs(
-      std::string prefix) = 0;
+      std::string prefix,
+      std::string startAfter,
+      uint32_t limit) = 0;
 
   // Removes the ref if its version is 'expectedVersion', or, with nullopt,
   // whatever its version. Returns whether it did.

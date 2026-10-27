@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,10 @@
 
 namespace kiln::rpc {
 class RpcServer;
+}
+
+namespace kiln::rdma {
+class RdmaMetadataServer;
 }
 
 namespace kiln::local {
@@ -25,8 +30,8 @@ struct LocalClusterOptions {
   meta::MetadataOptions metadata;
   // Where local-FS regions go; empty for the storage server's default.
   std::string localFsDir;
-  // DRAM servers also serve RDMA (StorageServerOptions::rdma), on the first
-  // interface with an RDMA device.
+  // The metadata server and DRAM servers also serve RDMA (kiln_meta --rdma,
+  // StorageServerOptions::rdma), on the first interface with an RDMA device.
   bool rdma{false};
 };
 
@@ -45,6 +50,12 @@ class LocalCluster {
     return metadataEndpoint_;
   }
 
+  // The metadata server's RDMA endpoint, for ClientOptions::rdmaMetadata;
+  // unset without the rdma option, an RDMA build or an RDMA device.
+  const std::optional<Endpoint>& rdmaMetadataEndpoint() const {
+    return rdmaMetadataEndpoint_;
+  }
+
   // The metadata server's state, e.g. to check free blocks in tests.
   meta::Metadata& metadata() const {
     return *metadata_;
@@ -58,6 +69,8 @@ class LocalCluster {
   std::shared_ptr<meta::Metadata> metadata_;
   std::unique_ptr<rpc::RpcServer> metadataServer_;
   Endpoint metadataEndpoint_;
+  std::unique_ptr<rdma::RdmaMetadataServer> rdmaMetadataServer_;
+  std::optional<Endpoint> rdmaMetadataEndpoint_;
   std::vector<std::unique_ptr<server::StorageServer>> servers_;
 };
 

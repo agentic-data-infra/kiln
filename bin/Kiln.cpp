@@ -41,6 +41,10 @@ DEFINE_string(
     "Directory of the local object store, to write through to and read from.");
 DEFINE_bool(tcp_only, false, "Use TCP (or RDMA) even for storage servers on this host.");
 DEFINE_bool(rdma, false, "Reach DRAM regions with RDMA (a -c kiln.rdma=true build).");
+DEFINE_string(
+    rdma_metadata,
+    "",
+    "The metadata server's RDMA endpoint (kiln_meta --rdma), host:port, to make the metadata calls over RDMA.");
 
 namespace kiln {
 namespace {
@@ -176,6 +180,9 @@ folly::coro::Task<int> co_main(const std::vector<std::string>& args) {
       .metadata = Endpoint::parse(metadata),
       .useShm = !FLAGS_tcp_only,
       .useRdma = FLAGS_rdma};
+  if (!FLAGS_rdma_metadata.empty()) {
+    options.rdmaMetadata = Endpoint::parse(FLAGS_rdma_metadata);
+  }
   if (!FLAGS_object_store.empty()) {
     options.objectStore = objectstore::makeLocalObjectStore(FLAGS_object_store);
   }

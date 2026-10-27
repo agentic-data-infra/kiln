@@ -1,3 +1,5 @@
+load("//kiln:options.bzl", "KILN_RDMA")
+
 # The in-process test mode: a whole cluster in one process.
 
 cxx_library(
@@ -9,6 +11,6 @@ cxx_library(
         "//kiln/meta:meta",
         "//kiln/server:server",
     ],
-    deps = ["//kiln/rpc:rpc"],
+    deps = ["//kiln/rpc:rpc"] + (["//kiln/rdma:rdma"] if KILN_RDMA else []),
     visibility = ["PUBLIC"],
 )

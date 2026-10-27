@@ -93,7 +93,10 @@ class Metadata : public rpc::MetadataRpc {
       std::optional<uint64_t> expectedVersion,
       std::string value) override;
 
-  folly::coro::Task<std::vector<Ref>> co_listRefs(std::string prefix) override;
+  folly::coro::Task<std::vector<Ref>> co_listRefs(
+      std::string prefix,
+      std::string startAfter,
+      uint32_t limit) override;
 
   folly::coro::Task<bool> co_removeRef(
       std::string name,

@@ -11,6 +11,7 @@
 #include "kiln/rpc/Rpc.h"
 #if KILN_RDMA
 #include "kiln/client/RdmaTransport.h"
+#include "kiln/rdma/RdmaMetadata.h"
 #endif
 
 namespace kiln::client {
@@ -20,11 +21,32 @@ namespace {
 // Forgets cached chunk infos past this many.
 constexpr size_t kMaxCachedChunks = 1 << 16;
 
+// Refs listed per call: at most kMaxRefNameSize + kMaxRefValueSize bytes
+// each, so a page fits an RDMA metadata message.
+constexpr uint32_t kRefsPerPage = 32;
+
+// Regions asked for per call, for the same reason.
+constexpr size_t kRegionsPerCall = 64;
+
+std::shared_ptr<rpc::MetadataRpc> connectMetadata(
+    const ClientOptions& options) {
+  if (!options.rdmaMetadata) {
+    return rpc::connectMetadata(options.metadata);
+  }
+#if KILN_RDMA
+  return rdma::connectRdmaMetadata(*options.rdmaMetadata);
+#else
+  throw Error(
+      ErrorCode::kInvalidArgument,
+      "RDMA needs a build with -c kiln.rdma=true");
+#endif
+}
+
 } // namespace
 
 Client::Client(ClientOptions options)
     : options_{std::move(options)},
-      metadata_{rpc::connectMetadata(options_.metadata)},
+      metadata_{connectMetadata(options_)},
       tcp_{makeTcpTransport()},
       shm_{makeShmTransport()} {
   if (options_.useRdma) {
@@ -208,8 +230,26 @@ folly::coro::Task<std::optional<Ref>> Client::co_casRef(
       std::move(name), expectedVersion, std::move(value));
 }
 
-folly::coro::Task<std::vector<Ref>> Client::co_listRefs(std::string prefix) {
-  co_return co_await metadata_->co_listRefs(std::move(prefix));
+folly::coro::Task<std::vector<Ref>> Client::co_listRefs(
+    std::string prefix,
+    std::string startAfter,
+    uint32_t limit) {
+  if (limit != 0) {
+    co_return co_await metadata_->co_listRefs(
+        std::move(prefix), std::move(startAfter), limit);
+  }
+  std::vector<Ref> refs;
+  for (;;) {
+    auto page =
+        co_await metadata_->co_listRefs(prefix, startAfter, kRefsPerPage);
+    for (auto& ref : page) {
+      refs.push_back(std::move(ref));
+    }
+    if (page.size() < kRefsPerPage) {
+      co_return refs;
+    }
+    startAfter = refs.back().name;
+  }
 }
 
 folly::coro::Task<bool> Client::co_removeRef(
@@ -232,8 +272,11 @@ folly::coro::Task<std::vector<RegionInfo>> Client::co_regions(
       }
     }
   }
-  if (!missing.empty()) {
-    auto infos = co_await metadata_->co_getRegions(std::move(missing));
+  for (size_t i = 0; i < missing.size(); i += kRegionsPerCall) {
+    std::vector<RegionId> ids(
+        missing.begin() + i,
+        missing.begin() + std::min(i + kRegionsPerCall, missing.size()));
+    auto infos = co_await metadata_->co_getRegions(std::move(ids));
     std::lock_guard lock(mutex_);
     for (auto& info : infos) {
       regions_[info.id] = std::move(info);

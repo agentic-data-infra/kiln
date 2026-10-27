@@ -1,3 +1,5 @@
+load("//kiln:options.bzl", "KILN_RDMA")
+
 cxx_binary(
     name = "transport_benchmark",
     srcs = ["TransportBenchmark.cpp"],
@@ -6,5 +8,15 @@ cxx_binary(
         "//kiln/local:local",
     ],
     # Archives must precede the prebuilt libraries they use.
+    link_ordering = "topological",
+)
+
+KILN_RDMA and cxx_binary(
+    name = "metadata_benchmark",
+    srcs = ["MetadataBenchmark.cpp"],
+    deps = [
+        "//kiln/meta:meta",
+        "//kiln/rdma:rdma",
+    ],
     link_ordering = "topological",
 )

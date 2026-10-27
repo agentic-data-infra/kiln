@@ -50,6 +50,10 @@ struct ClientOptions {
   // goes through a copy. Needs a build with -c kiln.rdma=true.
   bool useRdma{false};
   std::string rdmaHost;
+  // The metadata server's RDMA endpoint (kiln_meta --rdma); if set, the
+  // metadata calls go there over RDMA instead of to 'metadata' over TCP.
+  // Needs a build with -c kiln.rdma=true.
+  std::optional<Endpoint> rdmaMetadata;
 };
 
 struct ClientStats {
@@ -122,8 +126,13 @@ class Client {
       std::optional<uint64_t> expectedVersion,
       std::string value);
 
-  // The refs whose names start with 'prefix', by name.
-  folly::coro::Task<std::vector<Ref>> co_listRefs(std::string prefix);
+  // Up to 'limit' (0 for all) refs whose names start with 'prefix' and come
+  // after 'startAfter' (empty for from the first), by name. All of them are
+  // asked for in pages, which fit the metadata server's RDMA messages.
+  folly::coro::Task<std::vector<Ref>> co_listRefs(
+      std::string prefix,
+      std::string startAfter = {},
+      uint32_t limit = 0);
 
   // Removes the ref if its version is 'expectedVersion', or, with nullopt,
   // whatever its version. Returns whether it did.
