@@ -39,6 +39,11 @@ class Region {
     return length_;
   }
 
+  // A DRAM region's memory; nullptr for a local-FS region.
+  uint8_t* memory() const {
+    return memory_;
+  }
+
   // Throw Error(kInvalidArgument) for a range outside the region.
   std::unique_ptr<folly::IOBuf> read(uint64_t offset, uint64_t length) const;
   void write(uint64_t offset, const folly::IOBuf& data);

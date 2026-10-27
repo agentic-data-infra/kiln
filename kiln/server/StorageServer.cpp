@@ -1,5 +1,7 @@
 #include "kiln/server/StorageServer.h"
 
+#include <sys/resource.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -16,6 +18,16 @@
 #include "kiln/common/Error.h"
 #include "kiln/rpc/Rpc.h"
 #include "kiln/server/Region.h"
+#if KILN_RDMA
+#include "kiln/server/RdmaRegionServer.h"
+#endif
+
+namespace kiln::server {
+#if !KILN_RDMA
+// Never made without RDMA.
+class RdmaRegionServer {};
+#endif
+} // namespace kiln::server
 
 namespace kiln::server {
 
@@ -116,6 +128,48 @@ std::string makeDirectory(const StorageServerOptions& options) {
   return pattern;
 }
 
+// Serves the DRAM regions over RDMA, or returns nullptr with a warning if it
+// cannot.
+std::unique_ptr<RdmaRegionServer> startRdma(
+    const StorageServerOptions& options,
+    const std::vector<std::unique_ptr<Region>>& regions) {
+  if (!options.rdma) {
+    return nullptr;
+  }
+  if (options.tier != Tier::kDram) {
+    LOG(WARNING) << "RDMA serves DRAM regions only; serving "
+                 << toString(options.tier) << " over TCP";
+    return nullptr;
+  }
+#if KILN_RDMA
+  uint64_t bytes = 0;
+  std::vector<RdmaRegionServer::Memory> memory;
+  for (const auto& region : regions) {
+    memory.push_back({region->memory(), region->length()});
+    bytes += region->length();
+  }
+  // Registering pins the regions, which must fit the locked memory limit.
+  rlimit limit{};
+  if (::getrlimit(RLIMIT_MEMLOCK, &limit) == 0 &&
+      limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < bytes) {
+    LOG(WARNING) << "The locked memory limit (ulimit -l) of " << limit.rlim_cur
+                 << " bytes does not fit the regions' " << bytes
+                 << "; serving them over TCP only";
+    return nullptr;
+  }
+  try {
+    return RdmaRegionServer::start(options.rdmaHost, 0, memory);
+  } catch (const Error& e) {
+    LOG(WARNING) << e.what() << "; serving the regions over TCP only";
+    return nullptr;
+  }
+#else
+  LOG(WARNING) << "Built without RDMA (-c kiln.rdma=true); serving the "
+               << "regions over TCP only";
+  return nullptr;
+#endif
+}
+
 // Waits until the metadata server answers.
 folly::coro::Task<void> co_waitForMetadata(
     const Endpoint& metadata,
@@ -188,6 +242,7 @@ folly::coro::Task<std::unique_ptr<StorageServer>> StorageServer::co_start(
             .host = localHostName(), .path = regions.back()->path()}});
   }
 
+  server->rdma_ = startRdma(options, regions);
   server->store_ = std::make_shared<RegionStore>(std::move(regions));
   server->rpcServer_ =
       rpc::serveStorage(server->store_, options.bindHost, options.port);
@@ -198,6 +253,11 @@ folly::coro::Task<std::unique_ptr<StorageServer>> StorageServer::co_start(
     info.server = server->endpoint_.toString();
     info.tcp = TcpAccess{.endpoint = server->endpoint_};
   }
+#if KILN_RDMA
+  for (size_t i = 0; server->rdma_ != nullptr && i < infos.size(); ++i) {
+    infos[i].rdma = server->rdma_->access(i);
+  }
+#endif
 
   co_await co_waitForMetadata(options.metadata, options.connectTimeout);
   server->metadata_ = rpc::connectMetadata(options.metadata);
@@ -256,6 +316,7 @@ StorageServer::~StorageServer() {
     reregister_.join();
   }
   rpcServer_.reset();
+  rdma_.reset();
   store_.reset();
   if (!keep_) {
     std::error_code error;

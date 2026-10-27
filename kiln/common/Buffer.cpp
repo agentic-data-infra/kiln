@@ -33,6 +33,16 @@ Buffer Buffer::wrap(void* data, size_t capacity) {
   return buffer;
 }
 
+Buffer& Buffer::operator=(Buffer&& other) noexcept {
+  // The registration goes before the memory it covers.
+  registration_ = std::move(other.registration_);
+  owned_ = std::move(other.owned_);
+  data_ = other.data_;
+  size_ = other.size_;
+  capacity_ = other.capacity_;
+  return *this;
+}
+
 void Buffer::setSize(size_t size) {
   if (size > capacity_) {
     throw std::out_of_range(fmt::format(

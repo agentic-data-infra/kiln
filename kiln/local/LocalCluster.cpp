@@ -20,7 +20,8 @@ LocalCluster::LocalCluster(LocalClusterOptions options)
             .regions = options.regionsPerServer,
             .regionSize = options.regionSize,
             .budget = options.budget,
-            .dir = dir})));
+            .dir = dir,
+            .rdma = options.rdma && tier == Tier::kDram})));
   };
   for (uint32_t i = 0; i < options.dramServers; ++i) {
     start(Tier::kDram, "");

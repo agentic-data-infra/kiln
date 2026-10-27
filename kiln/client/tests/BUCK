@@ -1,3 +1,5 @@
+load("//kiln:options.bzl", "KILN_RDMA")
+
 cxx_test(
     name = "client_test",
     srcs = ["ClientTest.cpp"],
@@ -29,6 +31,18 @@ cxx_test(
         "//kiln/meta:meta",
         "//kiln/objectstore:objectstore",
         "//kiln/server:server",
+        "//kiln/tests:test_main",
+    ],
+    link_ordering = "topological",
+)
+
+KILN_RDMA and cxx_test(
+    name = "rdma_test",
+    srcs = ["RdmaTest.cpp"],
+    deps = [
+        "//kiln/client:client",
+        "//kiln/local:local",
+        "//kiln/rdma:rdma",
         "//kiln/tests:test_main",
     ],
     link_ordering = "topological",

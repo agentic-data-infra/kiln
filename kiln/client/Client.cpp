@@ -9,6 +9,9 @@
 #include "kiln/common/Error.h"
 #include "kiln/objectstore/ObjectStore.h"
 #include "kiln/rpc/Rpc.h"
+#if KILN_RDMA
+#include "kiln/client/RdmaTransport.h"
+#endif
 
 namespace kiln::client {
 
@@ -23,16 +26,53 @@ Client::Client(ClientOptions options)
     : options_{std::move(options)},
       metadata_{rpc::connectMetadata(options_.metadata)},
       tcp_{makeTcpTransport()},
-      shm_{makeShmTransport()} {}
+      shm_{makeShmTransport()} {
+  if (options_.useRdma) {
+#if KILN_RDMA
+    rdmaMemory_ = std::make_shared<RdmaMemory>(
+        rdma::Device::open(options_.rdmaHost));
+    rdmaStats_ = std::make_shared<RdmaStats>();
+    rdma_ = makeRdmaTransport(rdmaMemory_, rdmaStats_);
+#else
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        "RDMA needs a build with -c kiln.rdma=true");
+#endif
+  }
+}
 
 Client::~Client() = default;
 
 Buffer Client::allocateBuffer(size_t capacity) {
-  return Buffer::allocate(capacity);
+  auto buffer = Buffer::allocate(capacity);
+#if KILN_RDMA
+  if (rdmaMemory_ && capacity > 0) {
+    buffer.setRegistration(
+        rdmaMemory_->registerMemory(buffer.data(), capacity));
+  }
+#endif
+  return buffer;
 }
 
 Buffer Client::registerMemory(void* data, size_t length) {
-  return Buffer::wrap(data, length);
+  auto buffer = Buffer::wrap(data, length);
+#if KILN_RDMA
+  if (rdmaMemory_ && length > 0) {
+    buffer.setRegistration(rdmaMemory_->registerMemory(data, length));
+  }
+#endif
+  return buffer;
+}
+
+ClientStats Client::stats() const {
+  ClientStats stats;
+#if KILN_RDMA
+  if (rdmaStats_) {
+    stats.rdmaBytes = rdmaStats_->direct;
+    stats.rdmaCopiedBytes = rdmaStats_->bounced;
+  }
+#endif
+  return stats;
 }
 
 folly::coro::Task<std::unique_ptr<ChunkWriter>> Client::co_create(
@@ -212,6 +252,9 @@ Transport& Client::transportFor(const RegionInfo& region) {
   if (options_.useShm && shm_->canReach(region)) {
     return *shm_;
   }
+  if (rdma_ && rdma_->canReach(region)) {
+    return *rdma_;
+  }
   if (tcp_->canReach(region)) {
     return *tcp_;
   }
@@ -314,7 +357,7 @@ folly::coro::Task<ChunkId> ChunkWriter::co_commit() {
   auto replicas = replicas_;
   if (placement_.writeThrough == Tier::kObjectStore) {
     // The object store takes whole objects: read the chunk back.
-    auto data = Buffer::allocate(std::max<uint64_t>(size_, 1));
+    auto data = client_.allocateBuffer(std::max<uint64_t>(size_, 1));
     co_await client_.co_readReplica(id, replicas_[0], 0, size_, data.data());
     co_await client_.options_.objectStore->co_put(
         chunkObjectKey(id), folly::ByteRange(data.data(), size_));

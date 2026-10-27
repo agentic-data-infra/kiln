@@ -35,6 +35,8 @@ DEFINE_int32(port, 0, "Port to serve on; 0 for any.");
 DEFINE_string(host, "", "Host name clients reach this server by.");
 DEFINE_string(bind_host, "", "Interface to serve on; empty for all.");
 DEFINE_int32(connect_timeout_s, 60, "Seconds to keep trying the metadata server.");
+DEFINE_bool(rdma, false, "Also serve DRAM regions with RDMA (a -c kiln.rdma=true build).");
+DEFINE_string(rdma_host, "", "Interface to serve RDMA on; empty for the first with an RDMA device.");
 
 int main(int argc, char** argv) {
   FLAGS_logtostderr = true;
@@ -58,7 +60,9 @@ int main(int argc, char** argv) {
             .regionSize = static_cast<uint64_t>(FLAGS_region_size_mb) << 20,
             .budget = static_cast<uint64_t>(FLAGS_budget_mb) << 20,
             .dir = FLAGS_dir,
-            .connectTimeout = std::chrono::seconds(FLAGS_connect_timeout_s)}));
+            .connectTimeout = std::chrono::seconds(FLAGS_connect_timeout_s),
+            .rdma = FLAGS_rdma,
+            .rdmaHost = FLAGS_rdma_host}));
   } catch (const kiln::Error& e) {
     LOG(ERROR) << e.what();
     return 1;

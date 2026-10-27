@@ -1,8 +1,8 @@
 // The objects Kiln's metadata describes. Storage servers hold blocks inside
 // large regions of memory or file; the metadata server knows the regions and
 // which blocks make up each chunk; clients read and write blocks directly at
-// the servers, at (region, offset, length), so that with RDMA (later) servers
-// spend no CPU on data.
+// the servers, at (region, offset, length), so that with RDMA servers spend
+// no CPU on data.
 
 #pragma once
 
@@ -80,8 +80,10 @@ struct ShmAccess {
   bool operator==(const ShmAccess&) const = default;
 };
 
-// Reaching a region with one-sided RDMA. Set only if the region is
-// registered with the NIC; not implemented yet.
+// Reaching a region with one-sided RDMA: its bytes are at
+// [baseAddress, baseAddress + length) under 'rkey' at the storage server
+// listening for RDMA connections at 'endpoint'. Set only for DRAM regions of
+// storage servers that serve RDMA (StorageServerOptions::rdma).
 struct RdmaAccess {
   Endpoint endpoint;
   uint32_t rkey{0};

@@ -25,11 +25,15 @@ struct LocalClusterOptions {
   meta::MetadataOptions metadata;
   // Where local-FS regions go; empty for the storage server's default.
   std::string localFsDir;
+  // DRAM servers also serve RDMA (StorageServerOptions::rdma), on the first
+  // interface with an RDMA device.
+  bool rdma{false};
 };
 
 // A metadata server and storage servers in this process, for tests,
 // examples and benchmarks. They serve on 127.0.0.1 like separate processes
-// would, so clients use them as they would a real cluster.
+// would (RDMA on the RDMA device's address), so clients use them as they
+// would a real cluster.
 class LocalCluster {
  public:
   explicit LocalCluster(LocalClusterOptions options = {});
