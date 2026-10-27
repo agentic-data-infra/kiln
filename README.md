@@ -178,6 +178,8 @@ TCP over loopback, it measured:
   backend.
 - `kiln/server`: the storage server and its regions.
 - `kiln/client`: the client library and its transports.
+- `kiln/rdma`: RDMA support on rlib (with `kiln.rdma`): the device and
+  memory registration.
 - `kiln/local`: a whole cluster in one process, for tests, examples and
   benchmarks.
 - `kiln/catalog`: the catalog's memos, on the public client API.
@@ -210,7 +212,24 @@ buck2 test //...
 Re-run `scripts/gen_third_party.py` whenever the dependencies are rebuilt.
 
 Optional backends are build options in `.buckconfig`, off by default:
-`-c kiln.rdma=true` and `-c kiln.s3=true` (no code behind them yet).
+`-c kiln.rdma=true` and `-c kiln.s3=true` (no code behind it yet).
+
+The RDMA transport is built on [rlib](https://github.com/agentic-data-infra/rlib),
+a separate repository that Buck reaches as the cell `rlib`: a symlink at
+`third-party/rlib` to an rlib checkout (by default `../rlib`, next to Kiln),
+with its own `third-party/generated/deps.bzl` from the same `/opt/deps-gcc12`.
+It also needs rdma-core (`libibverbs-dev`, `librdmacm-dev`). Without
+`kiln.rdma`, nothing uses rlib, and the symlink need not exist.
+
+```
+(cd ../rlib && scripts/gen_third_party.py)
+scripts/link_rlib.sh                     # or scripts/link_rlib.sh <rlib dir>
+buck2 test -c kiln.rdma=true //...
+```
+
+Tests that need an RDMA device skip themselves when there is none; without
+an RDMA NIC, run rlib's `scripts/setup-rxe.sh` for Soft-RoCE. Registering
+memory pins it, up to the locked memory limit (`ulimit -l`).
 
 Kiln needs GCC 12: GCC 11 miscompiles `co_await` inside coroutine templates
 with this folly, which rules out fbthrift's generated `co_*` clients. folly

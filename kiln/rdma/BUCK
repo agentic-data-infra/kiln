@@ -1,0 +1,13 @@
+# Kiln's RDMA support, on rlib (see scripts/link_rlib.sh). Built only with
+# -c kiln.rdma=true; without it this package is empty.
+
+load("//kiln:options.bzl", "KILN_RDMA", "RDMA_DEPS")
+
+KILN_RDMA and cxx_library(
+    name = "rdma",
+    srcs = glob(["*.cpp"]),
+    header_namespace = "kiln/rdma",
+    exported_headers = glob(["*.h"]),
+    exported_deps = ["//kiln/common:common"] + RDMA_DEPS,
+    visibility = ["PUBLIC"],
+)

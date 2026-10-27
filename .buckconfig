@@ -3,6 +3,9 @@
   prelude = prelude
   toolchains = toolchains
   none = none
+  # rlib, for the RDMA transport: a symlink to its checkout, made by
+  # scripts/link_rlib.sh. Only needed with kiln.rdma = true.
+  rlib = third-party/rlib
 
 [cell_aliases]
   config = prelude
@@ -23,8 +26,9 @@
 [build]
   execution_platforms = prelude//platforms:default
 
-# Optional storage backends, off by default. Turn one on with e.g.
-# `buck2 build -c kiln.rdma=true //...`. No code behind them yet.
+# Optional backends, off by default. Turn one on with e.g.
+# `buck2 build -c kiln.rdma=true //...`. rdma needs rlib (see [cells]); s3
+# has no code behind it yet.
 [kiln]
   rdma = false
   s3 = false
