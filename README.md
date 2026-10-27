@@ -58,9 +58,9 @@ restart. Objects of removed chunks stay in the object store for now.
 
 Built with `-c kiln.rdma=true` (see Building), DRAM storage servers started
 with `--rdma` register their regions with the NIC and publish each region's
-address and key in its `RegionInfo` (`RdmaAccess`). Clients with
-`ClientOptions::useRdma` then read and write blocks with one-sided RDMA
-reads and writes: the storage server's CPU does no work for them, and the
+address and key in its `RegionInfo` (`RdmaAccess`). Clients built with
+RDMA and with an RDMA device then read and write those regions' blocks with
+one-sided RDMA reads and writes: the storage server's CPU does no work for them, and the
 bytes move straight between the region and the caller's buffer, with no
 copy on either side. For that the buffer must be registered with the NIC
 too: buffers from `Client::allocateBuffer` and `Client::registerMemory` are,
@@ -69,16 +69,35 @@ them. Other memory works, but goes through a copy (counted in
 `Client::stats()`, with a warning).
 
 ```cpp
-kiln::client::Client client({.metadata = metadata, .useRdma = true});
+kiln::client::Client client({.metadata = metadata});
+assert(client.stats().rdmaData);                  // has an RDMA device
 auto buffer = client.allocateBuffer(64 << 20);    // registered once
 buffer = co_await client.co_read(id, 0, 64 << 20, std::move(buffer));
 ```
 
 Clients use shared memory for servers on their own host, then RDMA, then
+TCP, region by region. `ClientOptions::useShm = false` (`kiln --no_shm`)
+skips shared memory, so that RDMA is used on one host too;
+`ClientOptions::dataForceTcp` (`kiln --data_force_tcp`) moves all data over
 TCP. Local-FS regions are served over TCP only. A storage server whose
 locked memory limit (`ulimit -l`) does not fit its regions, or that has no
-RDMA device, serves TCP only, with a warning. The metadata calls still go
-over TCP.
+RDMA device, serves TCP only, with a warning.
+
+The metadata calls can go over RDMA too, with rlib's RPC: `kiln_meta --rdma`
+also answers there (port 7471 by default, `--rdma_port`) and logs both
+URLs, e.g. `tcp://meta:7470,rdma://10.0.0.1:7471`. `ClientOptions::metadata`
+(`kiln --metadata`) takes that list (a bare `host:port` is `tcp://`). A
+client with an RDMA device and an `rdma://` URL makes all its metadata calls
+there, otherwise over `tcp://`; `ClientOptions::metaForceTcp`
+(`kiln --meta_force_tcp`) keeps them on TCP. The choice is made once, when
+the client is created: if the RDMA metadata server cannot be reached later,
+calls fail with `kUnavailable` rather than go over TCP. Storage servers
+keep registering over TCP, and take the same list (`kiln_server --metadata`).
+RDMA messages have a fixed size (64 KiB): a chunk takes about 12 bytes per
+block per copy, so chunks up to about 5 GiB fit (2.5 GiB written through
+to a second tier); calls whose request or response does not fit fail with
+`kTooLarge`. The client asks for refs (`co_listRefs`) and regions in pages
+that fit.
 
 ## Refs
 
@@ -158,14 +177,15 @@ auto data = co_await client.co_read(id, offset, length, std::move(buffer));
 A cluster on this machine, and the command line client:
 
 ```
-metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server; -b budget_mb, -j journal
+metadata=$(scripts/start_local_cluster.sh -d 2 -l 1)   # 2 DRAM, 1 local-FS server; -b budget_mb, -j journal, -R RDMA
 kiln() { $(buck2 build //bin:kiln --show-full-output | awk '{print $2}') --metadata=$metadata "$@"; }
 id=$(kiln put some/file)                # --tier=localfs for the local FS
 kiln --write_through=localfs put some/file
 kiln --object_store=/some/dir --write_through=objectstore put some/file
 kiln stat $id
-kiln get $id copy                       # --tcp_only to skip shared memory
-kiln --rdma --tcp_only get $id copy     # RDMA, with kiln_server --rdma
+kiln get $id copy                       # --no_shm to skip shared memory (RDMA with -R)
+kiln --data_force_tcp get $id copy      # data over TCP only
+kiln --meta_force_tcp stat $id          # metadata over TCP despite an rdma:// URL
 kiln rm $id
 kiln ref set head $id                   # prints the ref's version
 kiln ref set head $other_id VERSION     # only if head is still at VERSION
@@ -204,6 +224,16 @@ runs RDMA in the kernel, so it says little about a real NIC:
 |------|-----------|----------|----------|
 | DRAM | RDMA (rxe)| 0.8 GB/s | 0.87 GB/s |
 
+`buck2 run -c kiln.rdma=true //bench:metadata_benchmark` measures metadata
+calls one at a time, over TCP (loopback) and over RDMA (rxe0), on the same
+VM:
+
+| call   | TCP p50 / p99 | RDMA p50 / p99 |
+|--------|---------------|----------------|
+| lookup | 63 / 78 us    | 16 / 30 us     |
+| getRef | 62 / 76 us    | 16 / 30 us     |
+| commit | 65 / 79 us    | 16 / 30 us     |
+
 ## Layout
 
 - `kiln/common`: chunk ids, buffers, the metadata types (`Types.h`), errors.
@@ -215,7 +245,7 @@ runs RDMA in the kernel, so it says little about a real NIC:
 - `kiln/server`: the storage server and its regions.
 - `kiln/client`: the client library and its transports.
 - `kiln/rdma`: RDMA support on rlib (with `kiln.rdma`): the device and
-  memory registration. The RDMA transport is in `kiln/client`, the serving
+  memory registration, and the metadata calls over rlib's RPC. The RDMA transport is in `kiln/client`, the serving
   of regions in `kiln/server`.
 - `kiln/local`: a whole cluster in one process, for tests, examples and
   benchmarks.

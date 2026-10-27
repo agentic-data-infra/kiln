@@ -813,11 +813,16 @@ folly::coro::Task<std::optional<Ref>> Metadata::co_casRef(
   co_return ref;
 }
 
-folly::coro::Task<std::vector<Ref>> Metadata::co_listRefs(std::string prefix) {
+folly::coro::Task<std::vector<Ref>> Metadata::co_listRefs(
+    std::string prefix,
+    std::string startAfter,
+    uint32_t limit) {
   std::lock_guard lock(refMutex_);
   std::vector<Ref> result;
-  for (auto it = refs_.lower_bound(prefix);
-       it != refs_.end() && it->first.starts_with(prefix);
+  auto it = startAfter.empty() ? refs_.lower_bound(prefix)
+                               : refs_.upper_bound(std::max(startAfter, prefix));
+  for (; it != refs_.end() && it->first.starts_with(prefix) &&
+       (limit == 0 || result.size() < limit);
        ++it) {
     result.push_back(it->second);
   }

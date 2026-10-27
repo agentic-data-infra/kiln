@@ -14,6 +14,8 @@ const char* toString(ErrorCode code) {
       return "unavailable";
     case ErrorCode::kInternal:
       return "internal";
+    case ErrorCode::kTooLarge:
+      return "too large";
   }
   return "unknown";
 }

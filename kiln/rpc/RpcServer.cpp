@@ -108,8 +108,16 @@ class MetadataService
   }
 
   folly::coro::Task<std::unique_ptr<std::vector<thrift::Ref>>> co_listRefs(
-      std::unique_ptr<std::string> prefix) override {
-    auto result = co_await guarded(metadata_->co_listRefs(std::move(*prefix)));
+      std::unique_ptr<std::string> prefix,
+      std::unique_ptr<std::string> startAfter,
+      int32_t limit) override {
+    if (limit < 0) {
+      throw toThrift(Error(ErrorCode::kInvalidArgument, "Negative limit"));
+    }
+    auto result = co_await guarded(metadata_->co_listRefs(
+        std::move(*prefix),
+        std::move(*startAfter),
+        static_cast<uint32_t>(limit)));
     co_return boxed(toThrift(result));
   }
 

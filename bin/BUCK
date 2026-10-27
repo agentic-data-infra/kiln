@@ -1,5 +1,7 @@
 # Kiln's processes and its command line client.
 
+load("//kiln:options.bzl", "KILN_RDMA")
+
 cxx_library(
     name = "signals",
     exported_headers = ["Signals.h"],
@@ -12,7 +14,7 @@ cxx_binary(
     deps = [
         ":signals",
         "//kiln/meta:meta",
-    ],
+    ] + (["//kiln/rdma:rdma"] if KILN_RDMA else []),
     # Archives must precede the prebuilt libraries they use.
     link_ordering = "topological",
     visibility = ["PUBLIC"],

@@ -4,6 +4,7 @@ KILN_RDMA and cxx_test(
     name = "rdma_test",
     srcs = glob(["*.cpp"]),
     deps = [
+        "//kiln/meta:meta",
         "//kiln/rdma:rdma",
         "//kiln/tests:test_main",
     ],

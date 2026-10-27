@@ -451,7 +451,7 @@ TEST(MetadataTest, listRefs) {
   }
   auto names = [&](const std::string& prefix) {
     std::vector<std::string> result;
-    for (const auto& ref : blockingWait(metadata.co_listRefs(prefix))) {
+    for (const auto& ref : blockingWait(metadata.co_listRefs(prefix, "", 0))) {
       result.push_back(ref.name);
     }
     return result;
@@ -461,6 +461,23 @@ TEST(MetadataTest, listRefs) {
   EXPECT_EQ(names("memo"), (Names{"memo/a", "memo/b", "memos"}));
   EXPECT_EQ(names(""), (Names{"head", "memo/a", "memo/b", "memos"}));
   EXPECT_EQ(names("x"), Names{});
+
+  auto page = [&](const std::string& prefix,
+                  const std::string& startAfter,
+                  uint32_t limit) {
+    std::vector<std::string> result;
+    for (const auto& ref :
+         blockingWait(metadata.co_listRefs(prefix, startAfter, limit))) {
+      result.push_back(ref.name);
+    }
+    return result;
+  };
+  EXPECT_EQ(page("", "", 2), (Names{"head", "memo/a"}));
+  EXPECT_EQ(page("", "memo/a", 2), (Names{"memo/b", "memos"}));
+  EXPECT_EQ(page("", "memos", 2), Names{});
+  EXPECT_EQ(page("memo", "a", 1), (Names{"memo/a"}));
+  EXPECT_EQ(page("memo", "memo/a", 0), (Names{"memo/b", "memos"}));
+  EXPECT_EQ(page("memo/", "z", 0), Names{});
 }
 
 TEST(MetadataTest, refLimits) {
@@ -501,7 +518,7 @@ TEST(MetadataTest, refsSurviveRestartWithJournal) {
   }
   for (int restart = 0; restart < 2; ++restart) {
     Metadata metadata(options);
-    auto refs = blockingWait(metadata.co_listRefs(""));
+    auto refs = blockingWait(metadata.co_listRefs("", "", 0));
     ASSERT_EQ(refs.size(), 1);
     EXPECT_EQ(refs[0].name, "a");
     EXPECT_EQ(refs[0].value, "two");

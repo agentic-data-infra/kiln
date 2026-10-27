@@ -8,6 +8,9 @@ KILN_RDMA and cxx_library(
     srcs = glob(["*.cpp"]),
     header_namespace = "kiln/rdma",
     exported_headers = glob(["*.h"]),
-    exported_deps = ["//kiln/common:common"] + RDMA_DEPS,
+    exported_deps = [
+        "//kiln/common:common",
+        "//kiln/rpc:rpc",
+    ] + RDMA_DEPS,
     visibility = ["PUBLIC"],
 )

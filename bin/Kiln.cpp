@@ -1,20 +1,25 @@
 // kiln: Kiln's command line client.
 //
-//   kiln [--metadata=host:port] [--tier=dram|localfs]
+//   kiln [--metadata=URLS] [--tier=dram|localfs]
 //        [--write_through=localfs|objectstore] [--object_store=DIR]
-//        [--tcp_only] put FILE
-//   kiln [--metadata=host:port] get ID [FILE]
-//   kiln [--metadata=host:port] stat ID
-//   kiln [--metadata=host:port] rm ID
-//   kiln [--metadata=host:port] ref get NAME
-//   kiln [--metadata=host:port] ref set NAME VALUE [VERSION]
-//   kiln [--metadata=host:port] ref ls [PREFIX]
-//   kiln [--metadata=host:port] ref rm NAME [VERSION]
+//        put FILE
+//   kiln [--metadata=URLS] get ID [FILE]
+//   kiln [--metadata=URLS] stat ID
+//   kiln [--metadata=URLS] rm ID
+//   kiln [--metadata=URLS] ref get NAME
+//   kiln [--metadata=URLS] ref set NAME VALUE [VERSION]
+//   kiln [--metadata=URLS] ref ls [PREFIX]
+//   kiln [--metadata=URLS] ref rm NAME [VERSION]
 //
 // put stores FILE (- for stdin) as one chunk and prints its id; get writes
 // the chunk to FILE or stdout. ref set creates the ref, or with VERSION
-// updates it if it is at that version, and prints the new version. --metadata defaults to $KILN_METADATA, else
-// localhost:7470.
+// updates it if it is at that version, and prints the new version.
+//
+// --metadata is the metadata server's URLs, as kiln_meta prints them, e.g.
+// tcp://host:7470,rdma://10.0.0.1:7471 (MetadataAddress); it defaults to
+// $KILN_METADATA, else localhost:7470. Metadata calls go over RDMA if there
+// is an rdma:// URL and RDMA is usable here, and data over RDMA for regions
+// that offer it; --meta_force_tcp and --data_force_tcp make either use TCP.
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,7 +34,10 @@
 #include "kiln/common/Error.h"
 #include "kiln/objectstore/ObjectStore.h"
 
-DEFINE_string(metadata, "", "The metadata server, host:port.");
+DEFINE_string(
+    metadata,
+    "",
+    "The metadata server's URLs, e.g. tcp://host:7470,rdma://10.0.0.1:7471.");
 DEFINE_string(tier, "dram", "Where put stores the chunk: dram or localfs.");
 DEFINE_string(
     write_through,
@@ -39,8 +47,15 @@ DEFINE_string(
     object_store,
     "",
     "Directory of the local object store, to write through to and read from.");
-DEFINE_bool(tcp_only, false, "Use TCP (or RDMA) even for storage servers on this host.");
-DEFINE_bool(rdma, false, "Reach DRAM regions with RDMA (a -c kiln.rdma=true build).");
+DEFINE_bool(meta_force_tcp, false, "Make all metadata calls over TCP.");
+DEFINE_bool(
+    data_force_tcp,
+    false,
+    "Move all chunk data over TCP: no RDMA, no shared memory.");
+DEFINE_bool(
+    no_shm,
+    false,
+    "Do not map regions on this host; reach them with RDMA or TCP.");
 
 namespace kiln {
 namespace {
@@ -173,9 +188,10 @@ folly::coro::Task<int> co_main(const std::vector<std::string>& args) {
     metadata = env != nullptr ? env : "localhost:7470";
   }
   client::ClientOptions options{
-      .metadata = Endpoint::parse(metadata),
-      .useShm = !FLAGS_tcp_only,
-      .useRdma = FLAGS_rdma};
+      .metadata = MetadataAddress::parse(metadata),
+      .metaForceTcp = FLAGS_meta_force_tcp,
+      .dataForceTcp = FLAGS_data_force_tcp,
+      .useShm = !FLAGS_no_shm};
   if (!FLAGS_object_store.empty()) {
     options.objectStore = objectstore::makeLocalObjectStore(FLAGS_object_store);
   }

@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 #include <folly/coro/Collect.h>
+#include <glog/logging.h>
 
 #include "kiln/client/Transport.h"
 #include "kiln/common/Error.h"
@@ -11,6 +12,7 @@
 #include "kiln/rpc/Rpc.h"
 #if KILN_RDMA
 #include "kiln/client/RdmaTransport.h"
+#include "kiln/rdma/RdmaMetadata.h"
 #endif
 
 namespace kiln::client {
@@ -20,24 +22,56 @@ namespace {
 // Forgets cached chunk infos past this many.
 constexpr size_t kMaxCachedChunks = 1 << 16;
 
+// Refs listed per call: at most kMaxRefNameSize + kMaxRefValueSize bytes
+// each, so a page fits an RDMA metadata message.
+constexpr uint32_t kRefsPerPage = 32;
+
+// Regions asked for per call, for the same reason.
+constexpr size_t kRegionsPerCall = 64;
+
 } // namespace
 
 Client::Client(ClientOptions options)
     : options_{std::move(options)},
-      metadata_{rpc::connectMetadata(options_.metadata)},
       tcp_{makeTcpTransport()},
       shm_{makeShmTransport()} {
-  if (options_.useRdma) {
+  const bool rdmaMetadata = options_.metadata.rdma && !options_.metaForceTcp;
 #if KILN_RDMA
-    rdmaMemory_ = std::make_shared<RdmaMemory>(
-        rdma::Device::open(options_.rdmaHost));
+  // RDMA is usable if there is a device.
+  std::optional<rdma::Device> device;
+  if (rdmaMetadata || !options_.dataForceTcp) {
+    try {
+      device = rdma::Device::open(options_.rdmaHost);
+    } catch (const Error& e) {
+      if (rdmaMetadata) {
+        LOG(WARNING) << e.what() << "; metadata calls over TCP";
+      }
+    }
+  }
+  if (device && rdmaMetadata) {
+    metadata_ = rdma::connectRdmaMetadata(*options_.metadata.rdma);
+    rdmaMetadata_ = true;
+  }
+  if (device && !options_.dataForceTcp) {
+    rdmaMemory_ = std::make_shared<RdmaMemory>(std::move(*device));
     rdmaStats_ = std::make_shared<RdmaStats>();
     rdma_ = makeRdmaTransport(rdmaMemory_, rdmaStats_);
+  }
 #else
-    throw Error(
-        ErrorCode::kInvalidArgument,
-        "RDMA needs a build with -c kiln.rdma=true");
+  if (rdmaMetadata) {
+    LOG(WARNING) << "Built without RDMA (-c kiln.rdma=true); metadata calls "
+                 << "over TCP";
+  }
 #endif
+  if (metadata_ == nullptr) {
+    if (!options_.metadata.tcp) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format(
+              "No metadata URL this client can use in '{}'",
+              options_.metadata.toString()));
+    }
+    metadata_ = rpc::connectMetadata(*options_.metadata.tcp);
   }
 }
 
@@ -45,27 +79,35 @@ Client::~Client() = default;
 
 Buffer Client::allocateBuffer(size_t capacity) {
   auto buffer = Buffer::allocate(capacity);
-#if KILN_RDMA
-  if (rdmaMemory_ && capacity > 0) {
-    buffer.setRegistration(
-        rdmaMemory_->registerMemory(buffer.data(), capacity));
-  }
-#endif
+  registerWithNic(buffer);
   return buffer;
 }
 
 Buffer Client::registerMemory(void* data, size_t length) {
   auto buffer = Buffer::wrap(data, length);
+  registerWithNic(buffer);
+  return buffer;
+}
+
+void Client::registerWithNic(Buffer& buffer) {
 #if KILN_RDMA
-  if (rdmaMemory_ && length > 0) {
-    buffer.setRegistration(rdmaMemory_->registerMemory(data, length));
+  if (rdmaMemory_ == nullptr || buffer.capacity() == 0) {
+    return;
+  }
+  try {
+    buffer.setRegistration(
+        rdmaMemory_->registerMemory(buffer.data(), buffer.capacity()));
+  } catch (const Error& e) {
+    // Still usable, through a copy.
+    LOG_FIRST_N(WARNING, 1) << e.what();
   }
 #endif
-  return buffer;
 }
 
 ClientStats Client::stats() const {
   ClientStats stats;
+  stats.rdmaMetadata = rdmaMetadata_;
+  stats.rdmaData = rdma_ != nullptr;
 #if KILN_RDMA
   if (rdmaStats_) {
     stats.rdmaBytes = rdmaStats_->direct;
@@ -208,8 +250,26 @@ folly::coro::Task<std::optional<Ref>> Client::co_casRef(
       std::move(name), expectedVersion, std::move(value));
 }
 
-folly::coro::Task<std::vector<Ref>> Client::co_listRefs(std::string prefix) {
-  co_return co_await metadata_->co_listRefs(std::move(prefix));
+folly::coro::Task<std::vector<Ref>> Client::co_listRefs(
+    std::string prefix,
+    std::string startAfter,
+    uint32_t limit) {
+  if (limit != 0) {
+    co_return co_await metadata_->co_listRefs(
+        std::move(prefix), std::move(startAfter), limit);
+  }
+  std::vector<Ref> refs;
+  for (;;) {
+    auto page =
+        co_await metadata_->co_listRefs(prefix, startAfter, kRefsPerPage);
+    for (auto& ref : page) {
+      refs.push_back(std::move(ref));
+    }
+    if (page.size() < kRefsPerPage) {
+      co_return refs;
+    }
+    startAfter = refs.back().name;
+  }
 }
 
 folly::coro::Task<bool> Client::co_removeRef(
@@ -232,8 +292,11 @@ folly::coro::Task<std::vector<RegionInfo>> Client::co_regions(
       }
     }
   }
-  if (!missing.empty()) {
-    auto infos = co_await metadata_->co_getRegions(std::move(missing));
+  for (size_t i = 0; i < missing.size(); i += kRegionsPerCall) {
+    std::vector<RegionId> ids(
+        missing.begin() + i,
+        missing.begin() + std::min(i + kRegionsPerCall, missing.size()));
+    auto infos = co_await metadata_->co_getRegions(std::move(ids));
     std::lock_guard lock(mutex_);
     for (auto& info : infos) {
       regions_[info.id] = std::move(info);
@@ -249,7 +312,7 @@ folly::coro::Task<std::vector<RegionInfo>> Client::co_regions(
 }
 
 Transport& Client::transportFor(const RegionInfo& region) {
-  if (options_.useShm && shm_->canReach(region)) {
+  if (!options_.dataForceTcp && options_.useShm && shm_->canReach(region)) {
     return *shm_;
   }
   if (rdma_ && rdma_->canReach(region)) {

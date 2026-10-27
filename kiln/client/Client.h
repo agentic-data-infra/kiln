@@ -30,10 +30,20 @@ class RdmaMemory;
 struct RdmaStats;
 
 struct ClientOptions {
-  // The metadata server.
-  Endpoint metadata;
-  // Reach regions on this host by mapping their files instead of over TCP.
-  // Off to force TCP, e.g. to test it on one host.
+  // The metadata server's URLs (MetadataAddress). With an rdma:// one, and
+  // RDMA usable here (a -c kiln.rdma=true build, an RDMA device), all
+  // metadata calls go over RDMA, failing with kUnavailable rather than
+  // taking TCP if it cannot be reached; else all go over TCP.
+  MetadataAddress metadata;
+  // Make all metadata calls over TCP, even with an rdma:// URL.
+  bool metaForceTcp{false};
+  // Move all chunk data over TCP: no shared memory, no RDMA. Without it,
+  // the client reaches each region by mapping its file if it is on this
+  // host, else with one-sided RDMA if the region offers it (RdmaAccess, from
+  // kiln_server --rdma) and RDMA is usable here, else over TCP.
+  bool dataForceTcp{false};
+  // Reach regions on this host by mapping their files; off to use RDMA or
+  // TCP even there, e.g. to test them on one host.
   bool useShm{true};
   // How long a chunk's info is used without asking the metadata server
   // again. Must be well below the metadata server's grace period
@@ -43,12 +53,10 @@ struct ClientOptions {
   // The deployment's object store, to write chunks through to it and read
   // their copies there; none if unset.
   std::shared_ptr<objectstore::ObjectStore> objectStore;
-  // Reach regions with RdmaAccess with one-sided RDMA (after shared memory,
-  // before TCP), on the RDMA device of 'rdmaHost' (empty for the first
-  // interface that has one). Data then moves straight between the storage
-  // servers and buffers from allocateBuffer or registerMemory; other memory
-  // goes through a copy. Needs a build with -c kiln.rdma=true.
-  bool useRdma{false};
+  // The RDMA device to use: that of this local address, or, if empty, of
+  // the first interface that has one. With RDMA, chunk data moves straight
+  // between the storage servers and buffers from allocateBuffer or
+  // registerMemory; other memory goes through a copy.
   std::string rdmaHost;
 };
 
@@ -58,6 +66,10 @@ struct ClientStats {
   // Bytes moved with RDMA through a copy, as the caller's memory was not
   // registered.
   uint64_t rdmaCopiedBytes{0};
+  // Whether the metadata calls go over RDMA.
+  bool rdmaMetadata{false};
+  // Whether regions that offer RDMA are reached with it.
+  bool rdmaData{false};
 };
 
 class ChunkWriter;
@@ -122,8 +134,13 @@ class Client {
       std::optional<uint64_t> expectedVersion,
       std::string value);
 
-  // The refs whose names start with 'prefix', by name.
-  folly::coro::Task<std::vector<Ref>> co_listRefs(std::string prefix);
+  // Up to 'limit' (0 for all) refs whose names start with 'prefix' and come
+  // after 'startAfter' (empty for from the first), by name. All of them are
+  // asked for in pages, which fit the metadata server's RDMA messages.
+  folly::coro::Task<std::vector<Ref>> co_listRefs(
+      std::string prefix,
+      std::string startAfter = {},
+      uint32_t limit = 0);
 
   // Removes the ref if its version is 'expectedVersion', or, with nullopt,
   // whatever its version. Returns whether it did.
@@ -148,13 +165,18 @@ class Client {
 
   Transport& transportFor(const RegionInfo& region);
 
+  // Registers the buffer's memory with the NIC if RDMA is in use; if that
+  // fails, the buffer goes through a copy.
+  void registerWithNic(Buffer& buffer);
+
   void cacheChunk(const ChunkInfo& chunk);
 
   const ClientOptions options_;
-  const std::shared_ptr<rpc::MetadataRpc> metadata_;
+  std::shared_ptr<rpc::MetadataRpc> metadata_;
+  bool rdmaMetadata_{false};
   const std::unique_ptr<Transport> tcp_;
   const std::unique_ptr<Transport> shm_;
-  // Set with useRdma.
+  // Set if RDMA is usable for data.
   std::shared_ptr<RdmaMemory> rdmaMemory_;
   std::shared_ptr<RdmaStats> rdmaStats_;
   std::unique_ptr<Transport> rdma_;

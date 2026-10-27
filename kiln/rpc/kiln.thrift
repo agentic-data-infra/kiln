@@ -20,6 +20,7 @@ enum ErrorCode {
   INVALID_ARGUMENT = 2,
   UNAVAILABLE = 3,
   INTERNAL = 4,
+  TOO_LARGE = 5,
 }
 
 /// A kiln::Error thrown by a handler.
@@ -158,8 +159,13 @@ service MetadataService {
   /// ref, or none if the version did not match.
   RefLookup casRef(1: CasRefRequest request) throws (1: KilnException e);
 
-  /// The refs whose names start with 'prefix', by name.
-  list<Ref> listRefs(1: string prefix) throws (1: KilnException e);
+  /// Up to 'limit' (0 for all) refs whose names start with 'prefix' and
+  /// come after 'startAfter', by name.
+  list<Ref> listRefs(
+    1: string prefix,
+    2: string startAfter,
+    3: i32 limit,
+  ) throws (1: KilnException e);
 
   /// Returns whether the ref was removed.
   bool removeRef(1: RemoveRefRequest request) throws (1: KilnException e);

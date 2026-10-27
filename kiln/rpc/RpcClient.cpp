@@ -188,10 +188,13 @@ class RemoteMetadata : public MetadataRpc {
   }
 
   folly::coro::Task<std::vector<Ref>> co_listRefs(
-      std::string prefix) override {
+      std::string prefix,
+      std::string startAfter,
+      uint32_t limit) override {
     auto client = connection_.client();
-    co_return fromThrift(
-        co_await connection_.translated(client, client->co_listRefs(prefix)));
+    co_return fromThrift(co_await connection_.translated(
+        client,
+        client->co_listRefs(prefix, startAfter, static_cast<int32_t>(limit))));
   }
 
   folly::coro::Task<bool> co_removeRef(

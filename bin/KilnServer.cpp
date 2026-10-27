@@ -1,6 +1,6 @@
 // kiln_server: a Kiln storage server.
 //
-//   kiln_server --metadata=host:port [--tier=dram|localfs] [--regions=N]
+//   kiln_server --metadata=URLS [--tier=dram|localfs] [--regions=N]
 //               [--region_size_mb=M] [--budget_mb=B] [--dir=D] [--port=P]
 //               [--host=name]
 //               [--bind_host=name]
@@ -21,7 +21,7 @@
 #include "kiln/common/Error.h"
 #include "kiln/server/StorageServer.h"
 
-DEFINE_string(metadata, "", "The metadata server, host:port.");
+DEFINE_string(metadata, "", "The metadata server's URLs (kiln_meta prints them), or host:port; registers over TCP.");
 DEFINE_string(tier, "dram", "dram or localfs.");
 DEFINE_int32(regions, 1, "Regions to create.");
 DEFINE_int64(region_size_mb, 1024, "Size of each region in MiB.");
@@ -38,11 +38,25 @@ DEFINE_int32(connect_timeout_s, 60, "Seconds to keep trying the metadata server.
 DEFINE_bool(rdma, false, "Also serve DRAM regions with RDMA (a -c kiln.rdma=true build).");
 DEFINE_string(rdma_host, "", "Interface to serve RDMA on; empty for the first with an RDMA device.");
 
+namespace {
+
+// The metadata server's TCP endpoint, which storage servers register at.
+kiln::Endpoint metadataTcp() {
+  const auto address = kiln::MetadataAddress::parse(FLAGS_metadata);
+  if (!address.tcp) {
+    throw kiln::Error(
+        kiln::ErrorCode::kInvalidArgument, "--metadata needs a tcp:// URL");
+  }
+  return *address.tcp;
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
   FLAGS_logtostderr = true;
   folly::Init init(&argc, &argv);
   if (FLAGS_metadata.empty()) {
-    LOG(ERROR) << "--metadata=host:port is required";
+    LOG(ERROR) << "--metadata is required";
     return 2;
   }
   const auto signals = kiln::blockStopSignals();
@@ -51,7 +65,7 @@ int main(int argc, char** argv) {
   try {
     server = folly::coro::blockingWait(
         kiln::server::StorageServer::co_start(kiln::server::StorageServerOptions{
-            .metadata = kiln::Endpoint::parse(FLAGS_metadata),
+            .metadata = metadataTcp(),
             .bindHost = FLAGS_bind_host,
             .host = FLAGS_host,
             .port = static_cast<uint16_t>(FLAGS_port),

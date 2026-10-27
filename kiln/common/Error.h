@@ -15,6 +15,9 @@ enum class ErrorCode {
   // A server cannot be reached, or the connection to it broke.
   kUnavailable,
   kInternal,
+  // A call's arguments or result do not fit the transport's messages (RDMA
+  // metadata calls, whose messages have a fixed size).
+  kTooLarge,
 };
 
 const char* toString(ErrorCode code);
