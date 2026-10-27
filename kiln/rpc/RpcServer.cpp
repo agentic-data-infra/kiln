@@ -1,6 +1,12 @@
+#include <atomic>
+#include <future>
+
 #include <fmt/format.h>
+#include <folly/ExceptionString.h>
+#include <folly/SocketAddress.h>
+#include <glog/logging.h>
+#include <thrift/lib/cpp/server/TServerEventHandler.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
-#include <thrift/lib/cpp2/util/ScopedServerInterfaceThread.h>
 
 #include "kiln/rpc/Convert.h"
 #include "kiln/rpc/Rpc.h"
@@ -171,23 +177,76 @@ class StorageService
   const std::shared_ptr<StorageRpc> storage_;
 };
 
-std::unique_ptr<apache::thrift::ScopedServerInterfaceThread> serve(
+constexpr int kIoThreads = 4;
+constexpr int kHandlerThreads = 4;
+constexpr auto kStopTimeout = std::chrono::seconds(10);
+
+// Tells RpcServer once its server listens, or why it cannot.
+class Started : public apache::thrift::server::TServerEventHandler {
+ public:
+  void preServe(const folly::SocketAddress* address) override {
+    port_ = address->getPort();
+    done_ = true;
+    promise_.set_value();
+  }
+
+  void failed(std::exception_ptr error) {
+    if (done_.exchange(true)) {
+      LOG(ERROR) << "RPC server failed: "
+                 << folly::exceptionStr(error).toStdString();
+      return;
+    }
+    promise_.set_exception(std::move(error));
+  }
+
+  // The port served; throws why the server could not start.
+  uint16_t wait() {
+    promise_.get_future().get();
+    return port_;
+  }
+
+ private:
+  std::promise<void> promise_;
+  std::atomic<bool> done_{false};
+  uint16_t port_{0};
+};
+
+} // namespace
+
+RpcServer::RpcServer(
     std::shared_ptr<apache::thrift::AsyncProcessorFactory> service,
     const std::string& host,
-    uint16_t port) {
+    uint16_t port)
+    : server_{std::make_shared<apache::thrift::ThriftServer>()} {
   // "::" accepts IPv4 connections too.
   const auto bindHost = host.empty() ? std::string("::") : host;
+  server_->setInterface(std::move(service));
+  // Kiln's RPC is plaintext.
+  server_->setSSLPolicy(apache::thrift::SSLPolicy::DISABLED);
+  server_->setNumIOWorkerThreads(kIoThreads);
+  server_->setNumCPUWorkerThreads(kHandlerThreads);
+  // Calls wait for a handler thread as long as it takes, rather than failing
+  // after fbthrift's 100 ms queue timeout.
+  server_->setQueueTimeout(std::chrono::milliseconds(0));
+  // Clients keep their connections between calls.
+  server_->setIdleTimeout(std::chrono::milliseconds(0));
+  // Stopping waits this long for calls in flight; fbthrift aborts the process
+  // if one still runs then.
+  server_->setWorkersJoinTimeout(kStopTimeout);
+  auto started = std::make_shared<Started>();
+  server_->addServerEventHandler(started);
   try {
-    return std::make_unique<apache::thrift::ScopedServerInterfaceThread>(
-        std::move(service),
-        bindHost,
-        port,
-        [](apache::thrift::ThriftServer& server) {
-          // Clients keep their connections between calls.
-          server.setIdleTimeout(std::chrono::milliseconds(0));
-          server.setWorkersJoinTimeout(std::chrono::seconds(1));
-        });
+    server_->setAddress(folly::SocketAddress(bindHost, port));
+    thread_ = std::thread([server = server_, started] {
+      try {
+        server->serve();
+      } catch (...) {
+        started->failed(std::current_exception());
+      }
+    });
+    port_ = started->wait();
   } catch (const std::exception& e) {
+    stop();
     throw Error(
         ErrorCode::kUnavailable,
         fmt::format(
@@ -197,32 +256,35 @@ std::unique_ptr<apache::thrift::ScopedServerInterfaceThread> serve(
   }
 }
 
-} // namespace
+RpcServer::~RpcServer() {
+  stop();
+}
 
-RpcServer::RpcServer(
-    std::unique_ptr<apache::thrift::ScopedServerInterfaceThread> server)
-    : server_{std::move(server)} {}
-
-RpcServer::~RpcServer() = default;
+void RpcServer::stop() {
+  if (thread_.joinable()) {
+    server_->stop();
+    thread_.join();
+  }
+}
 
 uint16_t RpcServer::port() const {
-  return server_->getPort();
+  return port_;
 }
 
 std::unique_ptr<RpcServer> serveMetadata(
     std::shared_ptr<MetadataRpc> metadata,
     const std::string& host,
     uint16_t port) {
-  return std::unique_ptr<RpcServer>(new RpcServer(serve(
-      std::make_shared<MetadataService>(std::move(metadata)), host, port)));
+  return std::unique_ptr<RpcServer>(new RpcServer(
+      std::make_shared<MetadataService>(std::move(metadata)), host, port));
 }
 
 std::unique_ptr<RpcServer> serveStorage(
     std::shared_ptr<StorageRpc> storage,
     const std::string& host,
     uint16_t port) {
-  return std::unique_ptr<RpcServer>(new RpcServer(serve(
-      std::make_shared<StorageService>(std::move(storage)), host, port)));
+  return std::unique_ptr<RpcServer>(new RpcServer(
+      std::make_shared<StorageService>(std::move(storage)), host, port));
 }
 
 } // namespace kiln::rpc

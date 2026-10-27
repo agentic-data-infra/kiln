@@ -6,14 +6,16 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "kiln/common/Types.h"
 #include "kiln/rpc/MetadataRpc.h"
 #include "kiln/rpc/StorageRpc.h"
 
 namespace apache::thrift {
-class ScopedServerInterfaceThread;
-}
+class AsyncProcessorFactory;
+class ThriftServer;
+} // namespace apache::thrift
 
 namespace kiln::rpc {
 
@@ -39,10 +41,17 @@ class RpcServer {
       const std::string&,
       uint16_t);
 
-  explicit RpcServer(
-      std::unique_ptr<apache::thrift::ScopedServerInterfaceThread> server);
+  RpcServer(
+      std::shared_ptr<apache::thrift::AsyncProcessorFactory> service,
+      const std::string& host,
+      uint16_t port);
 
-  std::unique_ptr<apache::thrift::ScopedServerInterfaceThread> server_;
+  void stop();
+
+  // Serves on thread_ until stopped.
+  const std::shared_ptr<apache::thrift::ThriftServer> server_;
+  std::thread thread_;
+  uint16_t port_{0};
 };
 
 // Serves 'metadata' on 'host' (empty for all interfaces) and 'port' (0 for
