@@ -362,11 +362,26 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_getRegions(
 
 folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
     Tier tier,
-    uint32_t count) {
-  if (!hasBlocks(tier)) {
-    throw Error(
-        ErrorCode::kInvalidArgument,
-        fmt::format("The {} tier has no blocks", toString(tier)));
+    uint32_t count,
+    std::optional<Tier> overflow) {
+  for (auto t : {std::optional<Tier>(tier), overflow}) {
+    if (t && !hasBlocks(*t)) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("The {} tier has no blocks", toString(*t)));
+    }
+  }
+  if (overflow && *overflow != tier) {
+    // Checked and taken under one lock, so no other allocation can take
+    // the free blocks in between.
+    std::lock_guard lock(mutex_);
+    reclaimLocked(Clock::now());
+    if (freeBlocksLocked(tier) >= count) {
+      Clock::duration wait;
+      co_return std::move(
+          *tryAllocateLocked(tier, count, wait, /*evict=*/false));
+    }
+    tier = *overflow;
   }
   // Blocks freed before this call are reusable by the end of their grace
   // period; waiting longer would not help.
@@ -398,7 +413,8 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
 std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
     Tier tier,
     uint32_t count,
-    Clock::duration& wait) {
+    Clock::duration& wait,
+    bool evict) {
   const auto now = Clock::now();
   reclaimLocked(now);
 
@@ -422,7 +438,7 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
 
   // Keep some of the tier free, so that allocations rarely wait for the
   // grace period of the blocks they need.
-  if (available() < count + options_.evictBelow * budget) {
+  if (evict && available() < count + options_.evictBelow * budget) {
     evictLocked(
         tier, std::min<uint64_t>(budget, count + options_.evictUntil * budget));
   }
@@ -845,6 +861,10 @@ folly::coro::Task<bool> Metadata::co_removeRef(
 
 size_t Metadata::freeBlocks(Tier tier) const {
   std::lock_guard lock(mutex_);
+  return freeBlocksLocked(tier);
+}
+
+size_t Metadata::freeBlocksLocked(Tier tier) const {
   size_t count = 0;
   for (const auto& [name, server] : servers_) {
     if (server.tier == tier) {

@@ -118,18 +118,31 @@ ClientStats Client::stats() const {
 }
 
 folly::coro::Task<std::unique_ptr<ChunkWriter>> Client::co_create(
-    Placement placement) {
+    Placement placement,
+    uint64_t sizeHint) {
   if (!hasBlocks(placement.tier) || placement.writeThrough == placement.tier) {
     throw Error(
         ErrorCode::kInvalidArgument,
         fmt::format("Cannot place a chunk in {}", toString(placement.tier)));
+  }
+  if (placement.overflow &&
+      (!hasBlocks(*placement.overflow) ||
+       placement.overflow == placement.tier || placement.writeThrough)) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format(
+            "Cannot overflow from {} to {}{}",
+            toString(placement.tier),
+            toString(*placement.overflow),
+            placement.writeThrough ? " while writing through" : ""));
   }
   if (placement.writeThrough == Tier::kObjectStore && !options_.objectStore) {
     throw Error(
         ErrorCode::kInvalidArgument,
         "Writing through to the object store needs one in ClientOptions");
   }
-  co_return std::unique_ptr<ChunkWriter>(new ChunkWriter(*this, placement));
+  co_return std::unique_ptr<ChunkWriter>(
+      new ChunkWriter(*this, placement, sizeHint));
 }
 
 folly::coro::Task<Buffer>
@@ -336,9 +349,10 @@ void Client::cacheChunk(const ChunkInfo& chunk) {
       .expires = std::chrono::steady_clock::now() + options_.chunkCacheTtl};
 }
 
-ChunkWriter::ChunkWriter(Client& client, Placement placement)
+ChunkWriter::ChunkWriter(Client& client, Placement placement, uint64_t sizeHint)
     : client_{client},
       placement_{placement},
+      sizeHint_{sizeHint},
       hasher_{std::make_unique<ChunkHasher>()} {
   replicas_.push_back(Replica{.tier = placement.tier});
   if (placement.writeThrough && hasBlocks(*placement.writeThrough)) {
@@ -383,20 +397,43 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
     Replica& replica,
     folly::ByteRange bytes) {
   auto& blocks = replica.blocks;
-  // Fill the last block, then new ones.
-  const uint64_t room = blocks.empty() ? 0 : kBlockSize - blocks.back().length;
-  const size_t first = room > 0 ? blocks.size() - 1 : blocks.size();
+  // Fill the first block with room, then the next ones: the size hint may
+  // have allocated some ahead. Then new ones.
+  size_t first = blocks.size();
+  while (first > 0 && blocks[first - 1].length < kBlockSize) {
+    --first;
+  }
+  uint64_t room = 0;
+  for (size_t i = first; i < blocks.size(); ++i) {
+    room += kBlockSize - blocks[i].length;
+  }
   if (bytes.size() > room) {
-    const auto count = (bytes.size() - room + kBlockSize - 1) / kBlockSize;
+    auto count = (bytes.size() - room + kBlockSize - 1) / kBlockSize;
+    std::optional<Tier> overflow;
+    if (blocks.empty()) {
+      count = std::max(count, (sizeHint_ + kBlockSize - 1) / kBlockSize);
+      overflow = placement_.overflow;
+    }
     auto allocated = co_await client_.metadata_->co_allocate(
-        replica.tier, static_cast<uint32_t>(count));
+        replica.tier, static_cast<uint32_t>(count), overflow);
     for (auto& block : allocated) {
       block.length = 0;
       blocks.push_back(block);
     }
   }
-  std::vector<BlockRef> touched(blocks.begin() + first, blocks.end());
+  // The blocks this append writes to; the size hint may have allocated
+  // more.
+  size_t last = first;
+  for (uint64_t covered = 0; covered < bytes.size(); ++last) {
+    covered += kBlockSize - blocks[last].length;
+  }
+  std::vector<BlockRef> touched(blocks.begin() + first, blocks.begin() + last);
   const auto regions = co_await client_.co_regions(touched);
+  if (placement_.overflow) {
+    // The first allocation chose the tier; later ones stay in it.
+    replica.tier = regions[0].tier;
+    placement_ = Placement{.tier = replica.tier};
+  }
 
   std::vector<folly::coro::Task<void>> writes;
   size_t done = 0;
@@ -416,6 +453,18 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
 folly::coro::Task<ChunkId> ChunkWriter::co_commit() {
   checkOpen();
   closed_ = true;
+  placement_.overflow.reset();
+  // Blocks the size hint allocated beyond the chunk's bytes.
+  std::vector<BlockRef> unused;
+  for (auto& replica : replicas_) {
+    while (!replica.blocks.empty() && replica.blocks.back().length == 0) {
+      unused.push_back(replica.blocks.back());
+      replica.blocks.pop_back();
+    }
+  }
+  if (!unused.empty()) {
+    co_await client_.metadata_->co_free(std::move(unused));
+  }
   const auto id = hasher_->id();
   auto replicas = replicas_;
   if (placement_.writeThrough == Tier::kObjectStore) {

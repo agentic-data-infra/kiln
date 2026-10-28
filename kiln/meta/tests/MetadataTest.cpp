@@ -243,6 +243,40 @@ TEST(MetadataTest, evictsAheadOfNeed) {
   EXPECT_TRUE(exists(metadata, ChunkId{4, 4}));
 }
 
+TEST(MetadataTest, overflowInsteadOfEvicting) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {4});
+  registerServer(metadata, "b:1", Tier::kLocalFs, {4});
+
+  // Free DRAM blocks come first.
+  auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 3, Tier::kLocalFs));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 1);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 4);
+  blockingWait(metadata.co_free(std::move(blocks)));
+
+  // A committed chunk fills DRAM: overflow neither evicts it nor splits
+  // the allocation, but takes all blocks in local FS.
+  const auto chunk = commit(metadata, 1, 3);
+  blocks = blockingWait(metadata.co_allocate(Tier::kDram, 2, Tier::kLocalFs));
+  EXPECT_TRUE(exists(metadata, chunk));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 1);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 2);
+  auto regions = blockingWait(metadata.co_getRegions({blocks[0].region}));
+  EXPECT_EQ(regions[0].tier, Tier::kLocalFs);
+
+  // A full overflow tier evicts as usual.
+  commit(metadata, 2, 2, Tier::kLocalFs);
+  blockingWait(metadata.co_allocate(Tier::kDram, 2, Tier::kLocalFs));
+  EXPECT_EQ(metadata.evictions(), 1);
+  EXPECT_TRUE(exists(metadata, chunk));
+
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_allocate(Tier::kDram, 1, Tier::kObjectStore);
+      }()),
+      ErrorCode::kInvalidArgument);
+}
+
 TEST(MetadataTest, gracePeriodDelaysReuse) {
   Metadata metadata(MetadataOptions{
       .gracePeriod = 300ms, .evictBelow = 0, .evictUntil = 0});

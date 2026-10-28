@@ -143,9 +143,15 @@ struct BlockRef {
 // into 'writeThrough' before its commit returns. The metadata server
 // journals a written-through chunk's copy in its target tier, so with a
 // local FS or object store target, the chunk outlives restarts.
+//
+// With 'overflow' set (a tier of blocks, without 'writeThrough'), the chunk
+// goes into 'tier' if its first allocation fits into the free blocks there
+// without evicting anything, else into 'overflow' as a whole, which evicts
+// as usual. The committed chunk's placement names the tier it went to.
 struct Placement {
   Tier tier{Tier::kDram};
   std::optional<Tier> writeThrough;
+  std::optional<Tier> overflow;
 
   bool operator==(const Placement&) const = default;
 };

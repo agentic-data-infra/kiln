@@ -133,8 +133,14 @@ service MetadataService {
   list<RegionInfo> getRegions(1: list<i64> ids) throws (1: KilnException e);
 
   /// 'count' free blocks of length kBlockSize in the tier, evicting the
-  /// least recently used chunks there if needed.
-  list<BlockRef> allocate(1: Tier tier, 2: i32 count) throws (
+  /// least recently used chunks there if needed. With an overflow tier (a
+  /// list of at most one), only blocks free without evicting, else blocks
+  /// of the overflow tier.
+  list<BlockRef> allocate(
+    1: Tier tier,
+    2: i32 count,
+    3: list<Tier> overflow,
+  ) throws (
     1: KilnException e,
   );
 

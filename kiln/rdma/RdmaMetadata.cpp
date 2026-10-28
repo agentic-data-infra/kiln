@@ -43,7 +43,12 @@ folly::coro::Task<std::string> co_dispatch(
       break;
     case MetadataOp::kAllocate: {
       const auto tier = static_cast<Tier>(in.u8());
-      out.blocks(co_await metadata.co_allocate(tier, in.u32()));
+      const auto count = in.u32();
+      std::optional<Tier> overflow;
+      if (in.u8() != 0) {
+        overflow = static_cast<Tier>(in.u8());
+      }
+      out.blocks(co_await metadata.co_allocate(tier, count, overflow));
       break;
     }
     case MetadataOp::kFree:
@@ -211,11 +216,16 @@ class RdmaMetadataClient : public rpc::MetadataRpc {
 
   folly::coro::Task<std::vector<BlockRef>> co_allocate(
       Tier tier,
-      uint32_t count) override {
+      uint32_t count,
+      std::optional<Tier> overflow) override {
     MessageWriter request;
     request.u8(static_cast<uint8_t>(MetadataOp::kAllocate))
         .u8(static_cast<uint8_t>(tier))
-        .u32(count);
+        .u32(count)
+        .u8(overflow ? 1 : 0);
+    if (overflow) {
+      request.u8(static_cast<uint8_t>(*overflow));
+    }
     const auto response = co_await co_call(std::move(request));
     co_return readResponse(response).blocks();
   }

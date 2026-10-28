@@ -194,6 +194,32 @@ TEST_P(ClientTest, abortFreesBlocks) {
   EXPECT_THROW(blockingWait(writer->co_commit()), Error);
 }
 
+TEST_P(ClientTest, sizeHintAllocatesAhead) {
+  const auto& metadata = cluster_->metadata();
+  const auto freeBefore = metadata.freeBlocks(Tier::kDram);
+  // A hint of 5 MiB for 3 MiB: the first append takes 5 blocks, commit
+  // frees the 2 left over.
+  auto writer = blockingWait(client_->co_create({}, 5 << 20));
+  const auto data = bytes(3 << 20, 7);
+  blockingWait(writer->co_append(toBuffer(*client_, data.substr(0, 1 << 19))));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore - 5);
+  blockingWait(writer->co_append(toBuffer(*client_, data.substr(1 << 19))));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore - 5);
+  const auto id = blockingWait(writer->co_commit());
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore - 3);
+  EXPECT_EQ(get(id), data);
+  EXPECT_EQ(blockingWait(client_->co_stat(id)).replicas[0].blocks.size(), 3);
+
+  // A hint too small: later appends allocate more.
+  writer = blockingWait(client_->co_create({}, 1 << 20));
+  const auto more = bytes(3 << 20, 8);
+  for (size_t done = 0; done < more.size(); done += 1 << 19) {
+    blockingWait(writer->co_append(toBuffer(*client_, more.substr(done, 1 << 19))));
+  }
+  EXPECT_EQ(get(blockingWait(writer->co_commit())), more);
+  blockingWait(client_->co_remove(id));
+}
+
 TEST_P(ClientTest, notFound) {
   const auto id = ChunkId::of(folly::StringPiece("never written"));
   try {
