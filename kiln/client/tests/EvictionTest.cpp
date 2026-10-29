@@ -107,5 +107,47 @@ TEST_F(EvictionTest, cachedReadersFinishWithinTheGracePeriod) {
   writer.join();
 }
 
+// DRAM first, overflow to local FS: a chunk that does not fit into free
+// DRAM goes to local FS as a whole, and no DRAM chunk is evicted for it.
+TEST(OverflowTest, wholeChunksOverflowWithoutEvicting) {
+  local::LocalCluster cluster(local::LocalClusterOptions{
+      .dramServers = 1,
+      .localFsServers = 1,
+      .regionSize = 8 << 20,
+      .metadata = meta::MetadataOptions{.gracePeriod = 0ms}});
+  Client client(ClientOptions{.metadata = cluster.metadataEndpoint()});
+  const Placement placement{.tier = Tier::kDram, .overflow = Tier::kLocalFs};
+
+  // Four chunks of 3 MiB into 8 MiB of DRAM.
+  std::vector<ChunkId> ids;
+  for (char fill = 'a'; fill < 'e'; ++fill) {
+    const size_t size = 3 << 20;
+    auto writer = blockingWait(client.co_create(placement, size));
+    auto buffer = client.allocateBuffer(size);
+    std::memset(buffer.data(), fill, size);
+    buffer.setSize(size);
+    blockingWait(writer->co_append(std::move(buffer)));
+    ids.push_back(blockingWait(writer->co_commit()));
+  }
+  std::vector<Tier> tiers;
+  for (const auto& id : ids) {
+    const auto info = blockingWait(client.co_stat(id));
+    ASSERT_EQ(info.replicas.size(), 1);
+    EXPECT_EQ(info.placement, Placement{.tier = info.replicas[0].tier});
+    tiers.push_back(info.replicas[0].tier);
+  }
+  EXPECT_EQ(
+      tiers,
+      (std::vector<Tier>{
+          Tier::kDram, Tier::kDram, Tier::kLocalFs, Tier::kLocalFs}));
+  EXPECT_EQ(cluster.metadata().evictions(), 0);
+
+  EXPECT_THROW(
+      blockingWait(client.co_create(
+          Placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs,
+                    .overflow = Tier::kLocalFs})),
+      Error);
+}
+
 } // namespace
 } // namespace kiln::client

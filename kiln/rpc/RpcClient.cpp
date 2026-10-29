@@ -131,12 +131,19 @@ class RemoteMetadata : public MetadataRpc {
 
   folly::coro::Task<std::vector<BlockRef>> co_allocate(
       Tier tier,
-      uint32_t count) override {
+      uint32_t count,
+      std::optional<Tier> overflow) override {
+    std::vector<thrift::Tier> overflowTiers;
+    if (overflow) {
+      overflowTiers.push_back(static_cast<thrift::Tier>(*overflow));
+    }
     auto client = connection_.client();
     co_return fromThrift(co_await connection_.translated(
         client,
         client->co_allocate(
-            static_cast<thrift::Tier>(tier), static_cast<int32_t>(count))));
+            static_cast<thrift::Tier>(tier),
+            static_cast<int32_t>(count),
+            overflowTiers)));
   }
 
   folly::coro::Task<void> co_free(std::vector<BlockRef> blocks) override {

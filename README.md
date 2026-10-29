@@ -39,6 +39,19 @@ auto writer = co_await client.co_create(
     {.tier = kiln::Tier::kDram, .writeThrough = kiln::Tier::kLocalFs});
 ```
 
+With `Placement::overflow`, a chunk goes into its tier only if it fits into
+the blocks free there, without evicting anything; else all of it goes into
+the overflow tier, which evicts as usual. The metadata server checks and
+takes the blocks in one step, so concurrent writers never see a stale
+"full". The decision is made by the chunk's first allocation, so give
+`co_create` the chunk's size when you know it: the first append then
+allocates blocks for all of it (blocks left over are freed at commit).
+
+```cpp
+auto writer = co_await client.co_create(
+    {.tier = kiln::Tier::kDram, .overflow = kiln::Tier::kLocalFs}, size);
+```
+
 Eviction drops a chunk's copy in one tier; the chunk is gone when it has no
 copy left. A written-through chunk whose DRAM copy was evicted is still read
 from its other copy, and writing the same bytes again brings the DRAM copy

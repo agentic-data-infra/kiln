@@ -67,12 +67,20 @@ class MetadataService
   }
 
   folly::coro::Task<std::unique_ptr<std::vector<thrift::BlockRef>>>
-  co_allocate(thrift::Tier tier, int32_t count) override {
-    if (count < 0) {
-      throw toThrift(Error(ErrorCode::kInvalidArgument, "Negative count"));
+  co_allocate(
+      thrift::Tier tier,
+      int32_t count,
+      std::unique_ptr<std::vector<thrift::Tier>> overflow) override {
+    if (count < 0 || overflow->size() > 1) {
+      throw toThrift(Error(
+          ErrorCode::kInvalidArgument, "Negative count or overflow tiers"));
+    }
+    std::optional<Tier> overflowTier;
+    if (!overflow->empty()) {
+      overflowTier = static_cast<Tier>(overflow->front());
     }
     auto result = co_await guarded(metadata_->co_allocate(
-        static_cast<Tier>(tier), static_cast<uint32_t>(count)));
+        static_cast<Tier>(tier), static_cast<uint32_t>(count), overflowTier));
     co_return boxed(toThrift(result));
   }
 

@@ -101,9 +101,13 @@ class Client {
   ClientStats stats() const;
 
   // Starts a new chunk in the placement's tier, and its write-through
-  // tier if set.
+  // tier if set. With 'sizeHint', the chunk's expected size, the first
+  // append allocates blocks for that many bytes at once, so that a
+  // placement with an overflow tier puts the whole chunk into one tier.
+  // Blocks beyond the committed size are freed.
   folly::coro::Task<std::unique_ptr<ChunkWriter>> co_create(
-      Placement placement = {});
+      Placement placement = {},
+      uint64_t sizeHint = 0);
 
   // Reads up to 'length' bytes of the chunk at 'offset' into 'dst', which
   // must have the capacity; returns it with its size set to the bytes read
@@ -223,7 +227,7 @@ class ChunkWriter {
  private:
   friend class Client;
 
-  ChunkWriter(Client& client, Placement placement);
+  ChunkWriter(Client& client, Placement placement, uint64_t sizeHint);
 
   void checkOpen() const;
 
@@ -231,7 +235,9 @@ class ChunkWriter {
   folly::coro::Task<void> co_appendTo(Replica& replica, folly::ByteRange bytes);
 
   Client& client_;
-  const Placement placement_;
+  // The overflow tier is resolved by the first allocation.
+  Placement placement_;
+  const uint64_t sizeHint_;
   std::unique_ptr<ChunkHasher> hasher_;
   // The copies in tiers of blocks, by tier.
   std::vector<Replica> replicas_;
