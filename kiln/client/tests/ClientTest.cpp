@@ -252,6 +252,14 @@ TEST_P(ClientTest, buckets) {
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore);
 }
 
+TEST_P(ClientTest, writeThroughNeedsADurableTier) {
+  EXPECT_THROW(
+      blockingWait(client_->co_create(
+          kDefaultBucket,
+          {.tier = Tier::kLocalFs, .writeThrough = Tier::kDram})),
+      Error);
+}
+
 TEST_P(ClientTest, notFound) {
   const auto id = ChunkId::of(folly::StringPiece("never written"));
   try {

@@ -127,6 +127,13 @@ folly::coro::Task<std::unique_ptr<ChunkWriter>> Client::co_create(
         ErrorCode::kInvalidArgument,
         fmt::format("Cannot place a chunk in {}", toString(placement.tier)));
   }
+  if (placement.writeThrough && !isDurable(*placement.writeThrough)) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format(
+            "Cannot write through to {}, which is not durable",
+            toString(*placement.writeThrough)));
+  }
   if (placement.overflow &&
       (!hasBlocks(*placement.overflow) ||
        placement.overflow == placement.tier || placement.writeThrough)) {
