@@ -88,6 +88,10 @@ Tier parseTier(const std::string& name);
 
 using RegionId = uint64_t;
 
+// A group of chunks that are removed together, e.g. those of one job.
+using BucketId = uint64_t;
+constexpr BucketId kNoBucket = 0;
+
 // Reaching a region with the storage server's TCP service.
 struct TcpAccess {
   Endpoint endpoint;
@@ -148,10 +152,17 @@ struct BlockRef {
 // goes into 'tier' if its first allocation fits into the free blocks there
 // without evicting anything, else into 'overflow' as a whole, which evicts
 // as usual. The committed chunk's placement names the tier it went to.
+//
+// With 'bucket' set, the chunk goes into that bucket, which must exist when
+// it is committed (see rpc::MetadataRpc::co_createBucket). The bucket is
+// hashed into the chunk's id, so equal bytes in two buckets are two chunks.
 struct Placement {
   Tier tier{Tier::kDram};
   std::optional<Tier> writeThrough;
   std::optional<Tier> overflow;
+  // Trivially destructible, like the rest: GCC 12 destroys temporaries in a
+  // co_await's arguments twice, and placements are often such temporaries.
+  BucketId bucket{kNoBucket};
 
   bool operator==(const Placement&) const = default;
 };

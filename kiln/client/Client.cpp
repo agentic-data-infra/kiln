@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 #include <folly/coro/Collect.h>
+#include <folly/lang/Bits.h>
 #include <glog/logging.h>
 
 #include "kiln/client/Transport.h"
@@ -251,6 +252,20 @@ folly::coro::Task<bool> Client::co_remove(ChunkId id) {
   co_return co_await metadata_->co_remove(id);
 }
 
+folly::coro::Task<BucketId> Client::co_createBucket() {
+  co_return co_await metadata_->co_createBucket();
+}
+
+folly::coro::Task<bool> Client::co_deleteBucket(BucketId bucket) {
+  {
+    std::lock_guard lock(mutex_);
+    std::erase_if(chunks_, [&](const auto& entry) {
+      return entry.second.info.placement.bucket == bucket;
+    });
+  }
+  co_return co_await metadata_->co_deleteBucket(bucket);
+}
+
 folly::coro::Task<std::optional<Ref>> Client::co_getRef(std::string name) {
   co_return co_await metadata_->co_getRef(std::move(name));
 }
@@ -354,6 +369,12 @@ ChunkWriter::ChunkWriter(Client& client, Placement placement, uint64_t sizeHint)
       placement_{placement},
       sizeHint_{sizeHint},
       hasher_{std::make_unique<ChunkHasher>()} {
+  if (placement.bucket != kNoBucket) {
+    // The id covers the bucket's id, little endian, then the chunk's bytes.
+    const auto bucket = folly::Endian::little(placement.bucket);
+    hasher_->update(folly::ByteRange(
+        reinterpret_cast<const uint8_t*>(&bucket), sizeof(bucket)));
+  }
   replicas_.push_back(Replica{.tier = placement.tier});
   if (placement.writeThrough && hasBlocks(*placement.writeThrough)) {
     replicas_.push_back(Replica{.tier = *placement.writeThrough});
@@ -432,7 +453,8 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
   if (placement_.overflow) {
     // The first allocation chose the tier; later ones stay in it.
     replica.tier = regions[0].tier;
-    placement_ = Placement{.tier = replica.tier};
+    placement_.tier = replica.tier;
+    placement_.overflow.reset();
   }
 
   std::vector<folly::coro::Task<void>> writes;

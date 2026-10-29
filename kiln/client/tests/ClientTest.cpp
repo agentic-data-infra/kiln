@@ -220,6 +220,37 @@ TEST_P(ClientTest, sizeHintAllocatesAhead) {
   blockingWait(client_->co_remove(id));
 }
 
+TEST_P(ClientTest, buckets) {
+  const auto& metadata = cluster_->metadata();
+  const auto freeBefore = metadata.freeBlocks(Tier::kDram);
+  const auto job = blockingWait(client_->co_createBucket());
+
+  // The same bytes in a bucket and in none are two chunks.
+  const auto data = bytes(2 << 20, 9);
+  const auto outside = put(data);
+  const auto inside = put(data, Placement{.bucket = job});
+  EXPECT_NE(inside, outside);
+  EXPECT_EQ(outside, ChunkId::of(folly::StringPiece(data)));
+  const auto other = put(bytes(1 << 20, 10), Placement{.bucket = job});
+  EXPECT_EQ(get(inside), data);
+
+  EXPECT_TRUE(blockingWait(client_->co_deleteBucket(job)));
+  EXPECT_FALSE(blockingWait(client_->co_deleteBucket(job)));
+  EXPECT_THROW(blockingWait(client_->co_stat(inside)), Error);
+  EXPECT_THROW(blockingWait(client_->co_stat(other)), Error);
+  EXPECT_EQ(get(outside), data);
+
+  // A commit after the bucket is gone fails, and its blocks are freed.
+  try {
+    put(data, Placement{.bucket = job});
+    FAIL() << "Committed into a deleted bucket";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kNotFound);
+  }
+  blockingWait(client_->co_remove(outside));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore);
+}
+
 TEST_P(ClientTest, notFound) {
   const auto id = ChunkId::of(folly::StringPiece("never written"));
   try {

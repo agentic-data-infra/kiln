@@ -27,10 +27,18 @@ enum RecordKind : uint8_t {
   // A region's id.
   kRegionRemoved = 5,
   // A written-through chunk's id, size and placement, and its copy in the
-  // write-through tier.
+  // write-through tier; then its bucket, unless that is none (records from
+  // before buckets end there).
   kChunkSet = 6,
   // A chunk's id: its copy in the write-through tier is gone.
   kChunkRemoved = 7,
+  // A bucket's id.
+  kBucketSet = 8,
+  // A bucket's id; its chunks have kChunkRemoved records before.
+  kBucketRemoved = 9,
+  // The id of the next bucket, so that ids of removed buckets are not
+  // reused after the journal is rewritten.
+  kNextBucket = 10,
 };
 
 constexpr uint8_t kNoTier = 0xff;
@@ -76,6 +84,9 @@ RecordWriter chunkRecord(const ChunkInfo& chunk, const Replica& replica) {
       .u64(replica.blocks.size());
   for (const auto& block : replica.blocks) {
     record.u64(block.region).u64(block.offset).u64(block.length);
+  }
+  if (chunk.placement.bucket != kNoBucket) {
+    record.u64(chunk.placement.bucket);
   }
   return record;
 }
@@ -158,6 +169,10 @@ void Metadata::replay(folly::ByteRange record) {
         block.offset = reader.u64();
         block.length = reader.u64();
       }
+      if (!reader.done()) {
+        info.placement.bucket = reader.u64();
+        buckets_[info.placement.bucket].insert(info.id);
+      }
       auto it = chunks_.find(info.id);
       if (it != chunks_.end()) {
         eraseChunkLocked(it);
@@ -176,6 +191,18 @@ void Metadata::replay(folly::ByteRange record) {
       }
       break;
     }
+    case kBucketSet: {
+      const auto bucket = reader.u64();
+      buckets_[bucket];
+      nextBucket_ = std::max(nextBucket_, bucket + 1);
+      break;
+    }
+    case kBucketRemoved:
+      buckets_.erase(reader.u64());
+      break;
+    case kNextBucket:
+      nextBucket_ = std::max(nextBucket_, reader.u64());
+      break;
     default:
       throw Error(ErrorCode::kInternal, "Unknown journal record");
   }
@@ -186,6 +213,10 @@ std::vector<std::string> Metadata::snapshot() {
   records.push_back(RecordWriter().u8(kNextVersion).u64(nextVersion_).record());
   for (const auto& [name, ref] : refs_) {
     records.push_back(refRecord(ref).record());
+  }
+  records.push_back(RecordWriter().u8(kNextBucket).u64(nextBucket_).record());
+  for (const auto& [bucket, chunks] : buckets_) {
+    records.push_back(RecordWriter().u8(kBucketSet).u64(bucket).record());
   }
   for (const auto& [id, region] : regions_) {
     if (region.info.tier == Tier::kLocalFs) {
@@ -629,6 +660,10 @@ Metadata::ChunkMap::iterator Metadata::dropReplicaLocked(
   }
   info.replicas.erase(replica);
   if (info.replicas.empty()) {
+    auto bucket = buckets_.find(info.placement.bucket);
+    if (bucket != buckets_.end()) {
+      bucket->second.erase(info.id);
+    }
     return chunks_.erase(chunk);
   }
   return std::next(chunk);
@@ -713,6 +748,20 @@ folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
     }
   }
 
+  if (placement.bucket != kNoBucket) {
+    auto bucket = buckets_.find(placement.bucket);
+    if (bucket == buckets_.end()) {
+      // E.g. a late task of a job that is over; nobody has seen the blocks.
+      for (const auto& replica : chunk.replicas) {
+        freeLocked(replica.blocks, /*grace=*/false);
+      }
+      throw Error(
+          ErrorCode::kNotFound,
+          fmt::format("No bucket {}", placement.bucket));
+    }
+    bucket->second.insert(chunk.id);
+  }
+
   auto it = chunks_.find(chunk.id);
   if (it == chunks_.end()) {
     const auto id = chunk.id;
@@ -785,6 +834,33 @@ folly::coro::Task<bool> Metadata::co_remove(ChunkId id) {
     co_return false;
   }
   eraseChunkLocked(it);
+  co_return true;
+}
+
+folly::coro::Task<BucketId> Metadata::co_createBucket() {
+  std::lock_guard lock(mutex_);
+  const auto bucket = nextBucket_++;
+  buckets_[bucket];
+  append(RecordWriter().u8(kBucketSet).u64(bucket));
+  co_return bucket;
+}
+
+folly::coro::Task<bool> Metadata::co_deleteBucket(BucketId id) {
+  std::lock_guard lock(mutex_);
+  auto bucket = buckets_.find(id);
+  if (bucket == buckets_.end()) {
+    co_return false;
+  }
+  // Erasing a chunk takes it out of the bucket.
+  const std::vector<ChunkId> ids(bucket->second.begin(), bucket->second.end());
+  for (const auto& id : ids) {
+    auto it = chunks_.find(id);
+    if (it != chunks_.end()) {
+      eraseChunkLocked(it);
+    }
+  }
+  buckets_.erase(bucket);
+  append(RecordWriter().u8(kBucketRemoved).u64(id));
   co_return true;
 }
 

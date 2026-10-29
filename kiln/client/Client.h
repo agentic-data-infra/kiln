@@ -124,6 +124,13 @@ class Client {
   // any, stays.
   folly::coro::Task<bool> co_remove(ChunkId id);
 
+  // A new bucket, for chunks to remove together (see Placement::bucket).
+  folly::coro::Task<BucketId> co_createBucket();
+
+  // Removes the bucket and its chunks, as co_remove does; returns whether
+  // it existed.
+  folly::coro::Task<bool> co_deleteBucket(BucketId bucket);
+
   // Refs: small named values on the metadata server, updated with compare
   // and swap (see Ref and rpc::MetadataRpc).
 
@@ -203,7 +210,8 @@ class Client {
 // writing through to local FS, and are hashed on the way; nobody sees the
 // chunk before it is committed. Writing through to the object store, commit
 // reads the chunk back and puts it there first. If a chunk with the same
-// bytes exists already, commit returns its id and this copy is dropped.
+// bytes exists already in the same bucket (or none), commit returns its id
+// and this copy is dropped.
 // Not thread safe: one append at a time.
 class ChunkWriter {
  public:

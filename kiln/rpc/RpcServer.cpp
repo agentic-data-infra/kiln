@@ -106,6 +106,16 @@ class MetadataService
     co_return co_await guarded(metadata_->co_remove(fromThrift(*id)));
   }
 
+  folly::coro::Task<int64_t> co_createBucket() override {
+    co_return static_cast<int64_t>(
+        co_await guarded(metadata_->co_createBucket()));
+  }
+
+  folly::coro::Task<bool> co_deleteBucket(int64_t bucket) override {
+    co_return co_await guarded(
+        metadata_->co_deleteBucket(static_cast<BucketId>(bucket)));
+  }
+
   folly::coro::Task<std::unique_ptr<thrift::RefLookup>> co_getRef(
       std::unique_ptr<std::string> name) override {
     auto result = co_await guarded(metadata_->co_getRef(std::move(*name)));

@@ -179,6 +179,25 @@ and synced to disk before the call returns, and a restarted metadata server
 replays it (and then rewrites it with just its current state). Without a
 journal, refs are gone when the metadata server stops.
 
+## Buckets
+
+A bucket groups chunks that are removed together, e.g. those one job
+writes. `co_createBucket()` returns a new bucket's id (ids are never
+reused), chunks created with `Placement::bucket` set go into it, and
+`co_deleteBucket(id)` removes the bucket and all its chunks in one call.
+A commit into a bucket that does not exist, e.g. by a late task of a job
+whose bucket is deleted already, fails with `kNotFound` and frees the
+chunk's blocks. The bucket is hashed into a chunk's id, so equal bytes in
+two buckets are two chunks, and deleting one bucket never takes another's
+chunk. Buckets are journaled like refs.
+
+```cpp
+const auto bucket = co_await client.co_createBucket();
+auto writer = co_await client.co_create({.bucket = bucket});
+// ... append and commit chunks ...
+co_await client.co_deleteBucket(bucket);
+```
+
 ## Eviction
 
 Each storage server registers its regions with a byte budget (`kiln_server

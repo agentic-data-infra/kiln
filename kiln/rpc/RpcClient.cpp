@@ -173,6 +173,18 @@ class RemoteMetadata : public MetadataRpc {
         client, client->co_remove(request));
   }
 
+  folly::coro::Task<BucketId> co_createBucket() override {
+    auto client = connection_.client();
+    co_return static_cast<BucketId>(co_await connection_.translated(
+        client, client->co_createBucket()));
+  }
+
+  folly::coro::Task<bool> co_deleteBucket(BucketId bucket) override {
+    auto client = connection_.client();
+    co_return co_await connection_.translated(
+        client, client->co_deleteBucket(static_cast<int64_t>(bucket)));
+  }
+
   folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override {
     auto client = connection_.client();
     co_return fromThrift(

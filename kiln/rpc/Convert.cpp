@@ -98,6 +98,7 @@ thrift::Placement toThrift(const Placement& placement) {
   if (placement.writeThrough) {
     result.writeThrough() = static_cast<thrift::Tier>(*placement.writeThrough);
   }
+  result.bucket() = static_cast<int64_t>(placement.bucket);
   return result;
 }
 
@@ -106,6 +107,7 @@ Placement fromThrift(const thrift::Placement& placement) {
   if (placement.writeThrough()) {
     result.writeThrough = static_cast<Tier>(*placement.writeThrough());
   }
+  result.bucket = static_cast<BucketId>(*placement.bucket());
   return result;
 }
 

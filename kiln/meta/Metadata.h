@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kiln/meta/Journal.h"
@@ -28,8 +29,8 @@ struct MetadataOptions {
   // that later allocations find blocks whose grace period is over.
   double evictBelow{0.1};
   double evictUntil{0.2};
-  // The file that keeps refs, local-FS regions and written-through chunks
-  // across restarts; none if empty, and then all is gone when the metadata
+  // The file that keeps refs, buckets, local-FS regions and written-through
+  // chunks across restarts; none if empty, and then all is gone when the metadata
   // server stops.
   std::string journal;
 };
@@ -47,7 +48,7 @@ struct MetadataOptions {
 // the grace period. If only blocks in their grace period could satisfy an
 // allocation, it waits for them.
 //
-// With a journal, refs, local-FS regions and the copies of written-through
+// With a journal, refs, buckets, local-FS regions and the copies of written-through
 // chunks in their target tier are on disk before the call that changes them
 // returns, and a restarted metadata server has them back. Copies in regions
 // whose storage server has not registered again cannot be read until it
@@ -86,6 +87,10 @@ class Metadata : public rpc::MetadataRpc {
   // Objects of the chunk in an object store stay; the metadata server does
   // not reach object stores.
   folly::coro::Task<bool> co_remove(ChunkId id) override;
+
+  folly::coro::Task<BucketId> co_createBucket() override;
+
+  folly::coro::Task<bool> co_deleteBucket(BucketId bucket) override;
 
   folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override;
 
@@ -209,6 +214,9 @@ class Metadata : public rpc::MetadataRpc {
   std::map<std::string, Server> servers_;
   std::map<RegionId, Region> regions_;
   ChunkMap chunks_;
+  // The chunks of each bucket.
+  std::map<BucketId, std::unordered_set<ChunkId>> buckets_;
+  BucketId nextBucket_{1};
   // Per tier of blocks, least recently used first.
   LruList lru_[kBlockTiers];
   // In the order they were freed, so in order of reusableAt.
