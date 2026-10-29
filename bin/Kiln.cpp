@@ -71,7 +71,7 @@ folly::coro::Task<void> co_put(client::Client& client, const std::string& path) 
   if (!FLAGS_write_through.empty()) {
     placement.writeThrough = parseTier(FLAGS_write_through);
   }
-  auto writer = co_await client.co_create(placement);
+  auto writer = co_await client.co_create(kDefaultBucket, placement);
   auto buffer = client.allocateBuffer(kPieceSize);
   for (;;) {
     const auto n = std::fread(buffer.data(), 1, buffer.capacity(), file);

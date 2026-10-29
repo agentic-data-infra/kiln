@@ -93,6 +93,8 @@ struct ChunkInfo {
   2: i64 size;
   3: Placement placement;
   4: list<Replica> replicas;
+  /// 0 for the default bucket.
+  5: i64 bucket;
 }
 
 struct Ref {
@@ -147,7 +149,7 @@ service MetadataService {
   /// Returns blocks that allocate() handed out to the free lists.
   void free(1: list<BlockRef> blocks) throws (1: KilnException e);
 
-  /// Makes a chunk visible. The first commit of an id wins: later ones get
+  /// Makes a chunk visible, in its bucket, which must exist. The first commit of an id wins: later ones get
   /// the first one's chunk, with their copies in tiers it has no copy in
   /// added, and the blocks of their other copies are freed.
   ChunkInfo commit(1: ChunkInfo chunk) throws (1: KilnException e);
@@ -158,6 +160,15 @@ service MetadataService {
   /// Returns whether the chunk existed. Its blocks are freed after the grace
   /// period.
   bool remove(1: ChunkId id) throws (1: KilnException e);
+
+  /// A new bucket's id.
+  i64 createBucket() throws (1: KilnException e);
+
+  /// Removes the bucket and its chunks, whose blocks are reusable after
+  /// 'graceMs'; returns whether it existed.
+  bool deleteBucket(1: i64 bucket, 2: i64 graceMs) throws (
+    1: KilnException e,
+  );
 
   RefLookup getRef(1: string name) throws (1: KilnException e);
 

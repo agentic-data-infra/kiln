@@ -80,7 +80,7 @@ class RdmaTest : public testing::Test {
       const std::vector<uint8_t>& data,
       Buffer buffer,
       Placement placement = {}) {
-    auto writer = blockingWait(client_->co_create(placement));
+    auto writer = blockingWait(client_->co_create(kDefaultBucket, placement));
     const auto piece = buffer.capacity();
     for (size_t done = 0; done < data.size(); done += piece) {
       const auto n = std::min(piece, data.size() - done);
@@ -95,7 +95,7 @@ class RdmaTest : public testing::Test {
   // bytes that went over RDMA.
   static uint64_t writeRead(Client& client, const std::vector<uint8_t>& data) {
     const auto before = client.stats().rdmaBytes;
-    auto writer = blockingWait(client.co_create());
+    auto writer = blockingWait(client.co_create(kDefaultBucket));
     auto buffer = client.allocateBuffer(data.size());
     std::memcpy(buffer.data(), data.data(), data.size());
     buffer.setSize(data.size());

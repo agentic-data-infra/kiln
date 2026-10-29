@@ -123,6 +123,7 @@ MessageWriter& MessageWriter::chunk(const ChunkInfo& chunk) {
   if (chunk.placement.writeThrough) {
     u8(static_cast<uint8_t>(*chunk.placement.writeThrough));
   }
+  u64(chunk.bucket);
   u32(static_cast<uint32_t>(chunk.replicas.size()));
   for (const auto& replica : chunk.replicas) {
     u8(static_cast<uint8_t>(replica.tier));
@@ -283,6 +284,7 @@ ChunkInfo MessageReader::chunk() {
   if (u8()) {
     result.placement.writeThrough = static_cast<Tier>(u8());
   }
+  result.bucket = u64();
   result.replicas.resize(u32());
   for (auto& replica : result.replicas) {
     replica.tier = static_cast<Tier>(u8());

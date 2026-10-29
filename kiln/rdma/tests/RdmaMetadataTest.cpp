@@ -84,6 +84,16 @@ TEST_F(RdmaMetadataTest, makesAllCalls) {
   EXPECT_FALSE(blockingWait(client_->co_remove(chunk.id)));
   EXPECT_EQ(errorOf(client_->co_lookup(chunk.id)), ErrorCode::kNotFound);
 
+  const auto job = blockingWait(client_->co_createBucket());
+  EXPECT_NE(job, kDefaultBucket);
+  chunk.bucket = job;
+  chunk.replicas[0].blocks = blockingWait(client_->co_allocate(Tier::kDram, 3));
+  chunk.replicas[0].blocks.back().length = 100;
+  EXPECT_EQ(blockingWait(client_->co_commit(chunk)), chunk);
+  EXPECT_TRUE(blockingWait(client_->co_deleteBucket(job)));
+  EXPECT_FALSE(blockingWait(client_->co_deleteBucket(job)));
+  EXPECT_EQ(errorOf(client_->co_lookup(chunk.id)), ErrorCode::kNotFound);
+
   EXPECT_EQ(blockingWait(client_->co_getRef("a")), std::nullopt);
   const auto a = blockingWait(client_->co_casRef("a", std::nullopt, "one"));
   ASSERT_TRUE(a);

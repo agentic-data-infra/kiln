@@ -40,7 +40,7 @@ folly::coro::Task<catalog::Manifest> co_compute(
     client::Client& client,
     const Query& query) {
   const auto result = fmt::format("result of '{}'\n", query.key);
-  auto writer = co_await client.co_create(query.placement);
+  auto writer = co_await client.co_create(kDefaultBucket, query.placement);
   auto buffer = client.allocateBuffer(result.size());
   std::memcpy(buffer.data(), result.data(), result.size());
   buffer.setSize(result.size());

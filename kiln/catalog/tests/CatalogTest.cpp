@@ -27,7 +27,7 @@ class CatalogTest : public testing::Test {
         catalog_{client_} {}
 
   ChunkId put(const std::string& data, Placement placement = {}) {
-    auto writer = blockingWait(client_.co_create(placement));
+    auto writer = blockingWait(client_.co_create(kDefaultBucket, placement));
     auto buffer = client_.allocateBuffer(data.size());
     std::memcpy(buffer.data(), data.data(), data.size());
     buffer.setSize(data.size());

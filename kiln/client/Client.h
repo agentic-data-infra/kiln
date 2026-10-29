@@ -100,12 +100,13 @@ class Client {
 
   ClientStats stats() const;
 
-  // Starts a new chunk in the placement's tier, and its write-through
-  // tier if set. With 'sizeHint', the chunk's expected size, the first
+  // Starts a new chunk in 'bucket' (see co_createBucket), in the
+  // placement's tier, and its write-through tier if set. With 'sizeHint', the chunk's expected size, the first
   // append allocates blocks for that many bytes at once, so that a
   // placement with an overflow tier puts the whole chunk into one tier.
   // Blocks beyond the committed size are freed.
   folly::coro::Task<std::unique_ptr<ChunkWriter>> co_create(
+      BucketId bucket,
       Placement placement = {},
       uint64_t sizeHint = 0);
 
@@ -123,6 +124,16 @@ class Client {
   // Returns whether the chunk existed. Its object in the object store, if
   // any, stays.
   folly::coro::Task<bool> co_remove(ChunkId id);
+
+  // A new bucket, for chunks to remove together (see co_create).
+  folly::coro::Task<BucketId> co_createBucket();
+
+  // Removes the bucket and its chunks; returns whether it existed. Their
+  // blocks are reusable after 'grace' (see rpc::MetadataRpc), by default
+  // at once.
+  folly::coro::Task<bool> co_deleteBucket(
+      BucketId bucket,
+      std::chrono::milliseconds grace = {});
 
   // Refs: small named values on the metadata server, updated with compare
   // and swap (see Ref and rpc::MetadataRpc).
@@ -203,7 +214,8 @@ class Client {
 // writing through to local FS, and are hashed on the way; nobody sees the
 // chunk before it is committed. Writing through to the object store, commit
 // reads the chunk back and puts it there first. If a chunk with the same
-// bytes exists already, commit returns its id and this copy is dropped.
+// bytes exists already in the same bucket, commit returns its id
+// and this copy is dropped.
 // Not thread safe: one append at a time.
 class ChunkWriter {
  public:
@@ -227,7 +239,11 @@ class ChunkWriter {
  private:
   friend class Client;
 
-  ChunkWriter(Client& client, Placement placement, uint64_t sizeHint);
+  ChunkWriter(
+      Client& client,
+      BucketId bucket,
+      Placement placement,
+      uint64_t sizeHint);
 
   void checkOpen() const;
 
@@ -235,6 +251,7 @@ class ChunkWriter {
   folly::coro::Task<void> co_appendTo(Replica& replica, folly::ByteRange bytes);
 
   Client& client_;
+  const BucketId bucket_;
   // The overflow tier is resolved by the first allocation.
   Placement placement_;
   const uint64_t sizeHint_;

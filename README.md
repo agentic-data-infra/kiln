@@ -36,6 +36,7 @@ reads the fastest one it can reach (`co_stat` lists them).
 
 ```cpp
 auto writer = co_await client.co_create(
+    kiln::kDefaultBucket,
     {.tier = kiln::Tier::kDram, .writeThrough = kiln::Tier::kLocalFs});
 ```
 
@@ -49,7 +50,9 @@ allocates blocks for all of it (blocks left over are freed at commit).
 
 ```cpp
 auto writer = co_await client.co_create(
-    {.tier = kiln::Tier::kDram, .overflow = kiln::Tier::kLocalFs}, size);
+    kiln::kDefaultBucket,
+    {.tier = kiln::Tier::kDram, .overflow = kiln::Tier::kLocalFs},
+    size);
 ```
 
 Eviction drops a chunk's copy in one tier; the chunk is gone when it has no
@@ -179,6 +182,30 @@ and synced to disk before the call returns, and a restarted metadata server
 replays it (and then rewrites it with just its current state). Without a
 journal, refs are gone when the metadata server stops.
 
+## Buckets
+
+A bucket groups chunks that are removed together, e.g. those one job
+writes; every chunk is in one, `co_create`'s first argument. Chunks in the
+default bucket (`kDefaultBucket`), which cannot be deleted, stay until they
+are removed or evicted. `co_createBucket()` returns a new bucket's id (ids
+are never reused), and `co_deleteBucket(id)` removes the bucket and all its
+chunks in one call.
+Their blocks are reusable at once, not after the grace period (see
+Eviction): the caller knows nobody reads them anymore. `co_deleteBucket(id,
+grace)` waits `grace` (at most the grace period) instead.
+A commit into a bucket that does not exist, e.g. by a late task of a job
+whose bucket is deleted already, fails with `kNotFound` and frees the
+chunk's blocks. The bucket is hashed into a chunk's id, so equal bytes in
+two buckets are two chunks, and deleting one bucket never takes another's
+chunk. Buckets are journaled like refs.
+
+```cpp
+const auto bucket = co_await client.co_createBucket();
+auto writer = co_await client.co_create(bucket);
+// ... append and commit chunks ...
+co_await client.co_deleteBucket(bucket);
+```
+
 ## Eviction
 
 Each storage server registers its regions with a byte budget (`kiln_server
@@ -228,7 +255,8 @@ DRAM-only data turning into a miss.
 ```cpp
 kiln::client::Client client({.metadata = kiln::Endpoint::parse("localhost:7470")});
 
-auto writer = co_await client.co_create({.tier = kiln::Tier::kDram});
+auto writer = co_await client.co_create(
+    kiln::kDefaultBucket, {.tier = kiln::Tier::kDram});
 auto buffer = client.allocateBuffer(8 << 20);
 // ... fill the buffer, buffer.setSize(n) ...
 buffer = co_await writer->co_append(std::move(buffer));  // as often as needed

@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kiln/meta/Journal.h"
@@ -28,8 +29,8 @@ struct MetadataOptions {
   // that later allocations find blocks whose grace period is over.
   double evictBelow{0.1};
   double evictUntil{0.2};
-  // The file that keeps refs, local-FS regions and written-through chunks
-  // across restarts; none if empty, and then all is gone when the metadata
+  // The file that keeps refs, buckets, local-FS regions and written-through
+  // chunks across restarts; none if empty, and then all is gone when the metadata
   // server stops.
   std::string journal;
 };
@@ -47,7 +48,7 @@ struct MetadataOptions {
 // the grace period. If only blocks in their grace period could satisfy an
 // allocation, it waits for them.
 //
-// With a journal, refs, local-FS regions and the copies of written-through
+// With a journal, refs, buckets, local-FS regions and the copies of written-through
 // chunks in their target tier are on disk before the call that changes them
 // returns, and a restarted metadata server has them back. Copies in regions
 // whose storage server has not registered again cannot be read until it
@@ -86,6 +87,12 @@ class Metadata : public rpc::MetadataRpc {
   // Objects of the chunk in an object store stay; the metadata server does
   // not reach object stores.
   folly::coro::Task<bool> co_remove(ChunkId id) override;
+
+  folly::coro::Task<BucketId> co_createBucket() override;
+
+  folly::coro::Task<bool> co_deleteBucket(
+      BucketId bucket,
+      std::chrono::milliseconds grace = {}) override;
 
   folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override;
 
@@ -167,18 +174,28 @@ class Metadata : public rpc::MetadataRpc {
   // Moves blocks whose grace period is over to the free lists.
   void reclaimLocked(Clock::time_point now);
 
-  // Frees blocks at once, or after the grace period.
-  void freeLocked(const std::vector<BlockRef>& blocks, bool grace);
+  // Frees blocks at once, or after the grace period, or after 'period'
+  // (at most the grace period) if set.
+  void freeLocked(
+      const std::vector<BlockRef>& blocks,
+      bool grace,
+      std::optional<Clock::duration> period = std::nullopt);
 
   // Adds a copy to a chunk, journaling it if it is the chunk's copy in its
   // write-through tier.
   void addReplicaLocked(Chunk& chunk, Replica replica);
 
   // Drops the chunk's copy in 'tier'; erases the chunk if it was the last.
-  // Returns the chunk's next iterator in chunks_.
-  ChunkMap::iterator dropReplicaLocked(ChunkMap::iterator chunk, Tier tier);
+  // Returns the chunk's next iterator in chunks_. The blocks are reusable
+  // after the grace period, or 'period' if set (see freeLocked).
+  ChunkMap::iterator dropReplicaLocked(
+      ChunkMap::iterator chunk,
+      Tier tier,
+      std::optional<Clock::duration> period = std::nullopt);
 
-  void eraseChunkLocked(ChunkMap::iterator chunk);
+  void eraseChunkLocked(
+      ChunkMap::iterator chunk,
+      std::optional<Clock::duration> period = std::nullopt);
 
   // Drops a region and the copies with blocks in it.
   void dropRegionLocked(RegionId id);
@@ -209,9 +226,12 @@ class Metadata : public rpc::MetadataRpc {
   std::map<std::string, Server> servers_;
   std::map<RegionId, Region> regions_;
   ChunkMap chunks_;
+  // The chunks of each bucket.
+  std::map<BucketId, std::unordered_set<ChunkId>> buckets_;
+  BucketId nextBucket_{1};
   // Per tier of blocks, least recently used first.
   LruList lru_[kBlockTiers];
-  // In the order they were freed, so in order of reusableAt.
+  // In order of reusableAt.
   std::deque<GraceBlock> grace_;
   // Where the next allocation starts its round over the regions.
   RegionId nextAllocation_{0};

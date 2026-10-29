@@ -128,12 +128,14 @@ thrift::ChunkInfo toThrift(const ChunkInfo& chunk) {
   result.size() = static_cast<int64_t>(chunk.size);
   result.placement() = toThrift(chunk.placement);
   result.replicas() = toThrift(chunk.replicas);
+  result.bucket() = static_cast<int64_t>(chunk.bucket);
   return result;
 }
 
 ChunkInfo fromThrift(const thrift::ChunkInfo& chunk) {
   return ChunkInfo{
       .id = fromThrift(*chunk.id()),
+      .bucket = static_cast<BucketId>(*chunk.bucket()),
       .size = static_cast<uint64_t>(*chunk.size()),
       .placement = fromThrift(*chunk.placement()),
       .replicas = fromThrift(*chunk.replicas())};

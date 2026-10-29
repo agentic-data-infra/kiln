@@ -29,9 +29,15 @@ std::vector<RegionInfo> registerServer(
 }
 
 // Commits a chunk of 'blocks' full blocks in 'tier'.
-ChunkId commit(Metadata& metadata, uint64_t id, uint32_t blocks, Tier tier = Tier::kDram) {
+ChunkId commit(
+    Metadata& metadata,
+    uint64_t id,
+    uint32_t blocks,
+    Tier tier = Tier::kDram,
+    BucketId bucket = kDefaultBucket) {
   ChunkInfo chunk{
       .id = ChunkId{id, id},
+      .bucket = bucket,
       .size = blocks * kBlockSize,
       .placement = Placement{.tier = tier},
       .replicas = {Replica{
@@ -442,6 +448,117 @@ TEST(MetadataTest, journalKeepsWrittenThroughCopies) {
   for (const auto& block : blockingWait(metadata.co_allocate(Tier::kLocalFs, 3))) {
     EXPECT_NE(block, durable.replicas[1].blocks[0]);
   }
+}
+
+TEST(MetadataTest, bucketsRemoveTheirChunks) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {8});
+  const auto job = blockingWait(metadata.co_createBucket());
+  EXPECT_NE(job, kDefaultBucket);
+  EXPECT_NE(blockingWait(metadata.co_createBucket()), job);
+  const auto a = commit(metadata, 1, 2, Tier::kDram, job);
+  const auto b = commit(metadata, 2, 2, Tier::kDram, job);
+  const auto outside = commit(metadata, 3, 2);
+  EXPECT_EQ(blockingWait(metadata.co_lookup(a)).bucket, job);
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_deleteBucket(kDefaultBucket);
+      }()),
+      ErrorCode::kInvalidArgument);
+
+  EXPECT_TRUE(blockingWait(metadata.co_deleteBucket(job)));
+  EXPECT_FALSE(blockingWait(metadata.co_deleteBucket(job)));
+  EXPECT_FALSE(exists(metadata, a));
+  EXPECT_FALSE(exists(metadata, b));
+  EXPECT_TRUE(exists(metadata, outside));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 6);
+
+  // A late commit into the deleted bucket fails and frees its blocks.
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        commit(metadata, 4, 2, Tier::kDram, job);
+        co_return;
+      }()),
+      ErrorCode::kNotFound);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 6);
+  EXPECT_FALSE(exists(metadata, ChunkId{4, 4}));
+}
+
+TEST(MetadataTest, deletedBucketsSkipTheGracePeriod) {
+  Metadata metadata(MetadataOptions{
+      .gracePeriod = 30s, .evictBelow = 0, .evictUntil = 0});
+  registerServer(metadata, "a:1", Tier::kDram, {8});
+  // Removed: its blocks wait out the 30 s.
+  EXPECT_TRUE(blockingWait(metadata.co_remove(commit(metadata, 1, 2))));
+  const auto now = blockingWait(metadata.co_createBucket());
+  commit(metadata, 2, 2, Tier::kDram, now);
+  const auto soon = blockingWait(metadata.co_createBucket());
+  commit(metadata, 3, 2, Tier::kDram, soon);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 2);
+
+  // By default, at once.
+  blockingWait(metadata.co_deleteBucket(now));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 4);
+  EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 2);
+
+  // A short grace: reusable before the removed chunk's blocks.
+  blockingWait(metadata.co_deleteBucket(soon, 20ms));
+  EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 4);
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(blockingWait(metadata.co_allocate(Tier::kDram, 6)).size(), 6);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+  EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 2);
+}
+
+TEST(MetadataTest, evictedChunksLeaveTheirBucket) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {4});
+  const auto job = blockingWait(metadata.co_createBucket());
+  const auto evicted = commit(metadata, 1, 4, Tier::kDram, job);
+  const auto kept = commit(metadata, 2, 4, Tier::kDram, job);
+  EXPECT_FALSE(exists(metadata, evicted));
+  EXPECT_TRUE(blockingWait(metadata.co_deleteBucket(job)));
+  EXPECT_FALSE(exists(metadata, kept));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 4);
+}
+
+TEST(MetadataTest, bucketsSurviveRestartWithJournal) {
+  folly::test::TemporaryDirectory dir;
+  MetadataOptions options = exact();
+  options.journal = dir.path().string() + "/journal";
+  BucketId job;
+  BucketId gone;
+  ChunkId chunk;
+  {
+    Metadata metadata(options);
+    registerServer(metadata, "a:1", Tier::kDram, {4});
+    job = blockingWait(metadata.co_createBucket());
+    gone = blockingWait(metadata.co_createBucket());
+    blockingWait(metadata.co_deleteBucket(gone));
+    ChunkInfo info{
+        .id = ChunkId{1, 1},
+        .bucket = job,
+        .size = kBlockSize,
+        .placement = {.tier = Tier::kDram, .writeThrough = Tier::kObjectStore},
+        .replicas = {
+            Replica{
+                .tier = Tier::kDram,
+                .blocks = blockingWait(metadata.co_allocate(Tier::kDram, 1))},
+            Replica{.tier = Tier::kObjectStore}}};
+    chunk = blockingWait(metadata.co_commit(std::move(info))).id;
+  }
+  {
+    Metadata metadata(options);
+    EXPECT_TRUE(exists(metadata, chunk));
+    EXPECT_FALSE(blockingWait(metadata.co_deleteBucket(gone)));
+    // The ids of removed buckets are not handed out again.
+    EXPECT_GT(blockingWait(metadata.co_createBucket()), gone);
+    EXPECT_TRUE(blockingWait(metadata.co_deleteBucket(job)));
+  }
+  Metadata metadata(options);
+  EXPECT_FALSE(exists(metadata, chunk));
+  EXPECT_FALSE(blockingWait(metadata.co_deleteBucket(job)));
+  EXPECT_GT(blockingWait(metadata.co_createBucket()), gone + 1);
 }
 
 std::optional<Ref> cas(

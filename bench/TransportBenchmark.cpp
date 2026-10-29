@@ -49,7 +49,7 @@ co_measure(client::Client& client, Tier tier, const std::string& name) {
   buffer.setSize(piece);
 
   auto start = Clock::now();
-  auto writer = co_await client.co_create(Placement{.tier = tier});
+  auto writer = co_await client.co_create(kDefaultBucket, {.tier = tier});
   for (uint64_t done = 0; done < size; done += piece) {
     // Vary one byte per piece so the chunk is not all repeats.
     buffer.data()[0] = static_cast<uint8_t>(done / piece);

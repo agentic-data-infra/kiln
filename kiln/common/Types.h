@@ -88,6 +88,13 @@ Tier parseTier(const std::string& name);
 
 using RegionId = uint64_t;
 
+// A group of chunks that are removed together, e.g. those of one job (see
+// rpc::MetadataRpc::co_createBucket). Every chunk is in one. The default
+// bucket always exists and cannot be deleted: its chunks stay until they
+// are removed or evicted.
+using BucketId = uint64_t;
+constexpr BucketId kDefaultBucket = 0;
+
 // Reaching a region with the storage server's TCP service.
 struct TcpAccess {
   Endpoint endpoint;
@@ -169,6 +176,9 @@ struct Replica {
 // copy in one tier; the chunk is gone when it has none left.
 struct ChunkInfo {
   ChunkId id;
+  // Hashed into the id with the bytes (except the default bucket), so equal
+  // bytes in two buckets are two chunks.
+  BucketId bucket{kDefaultBucket};
   uint64_t size{0};
   Placement placement;
   std::vector<Replica> replicas;

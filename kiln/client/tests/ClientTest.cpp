@@ -67,8 +67,9 @@ class ClientTest : public testing::TestWithParam<bool> {
   ChunkId put(
       const std::string& data,
       Placement placement = {},
-      size_t piece = 3 << 20) {
-    auto writer = blockingWait(client_->co_create(placement));
+      size_t piece = 3 << 20,
+      BucketId bucket = kDefaultBucket) {
+    auto writer = blockingWait(client_->co_create(bucket, placement));
     auto buffer = client_->allocateBuffer(piece);
     for (size_t done = 0; done < data.size(); done += piece) {
       const auto n = std::min(piece, data.size() - done);
@@ -172,7 +173,7 @@ TEST_P(ClientTest, firstCommitWins) {
   // own blocks are freed.
   Client other(ClientOptions{
       .metadata = cluster_->metadataEndpoint(), .useShm = GetParam()});
-  auto writer = blockingWait(other.co_create());
+  auto writer = blockingWait(other.co_create(kDefaultBucket));
   blockingWait(writer->co_append(toBuffer(other, data)));
   EXPECT_EQ(blockingWait(writer->co_commit()), first);
   EXPECT_EQ(blockingWait(other.co_stat(first)).replicas[0].blocks, blocks);
@@ -186,7 +187,7 @@ TEST_P(ClientTest, abortFreesBlocks) {
   const auto& metadata = cluster_->metadata();
   const auto freeBefore = metadata.freeBlocks(Tier::kLocalFs);
   auto writer =
-      blockingWait(client_->co_create(Placement{.tier = Tier::kLocalFs}));
+      blockingWait(client_->co_create(kDefaultBucket, {.tier = Tier::kLocalFs}));
   blockingWait(writer->co_append(toBuffer(*client_, bytes(2 << 20))));
   EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), freeBefore - 2);
   blockingWait(writer->co_abort());
@@ -199,7 +200,7 @@ TEST_P(ClientTest, sizeHintAllocatesAhead) {
   const auto freeBefore = metadata.freeBlocks(Tier::kDram);
   // A hint of 5 MiB for 3 MiB: the first append takes 5 blocks, commit
   // frees the 2 left over.
-  auto writer = blockingWait(client_->co_create({}, 5 << 20));
+  auto writer = blockingWait(client_->co_create(kDefaultBucket, {}, 5 << 20));
   const auto data = bytes(3 << 20, 7);
   blockingWait(writer->co_append(toBuffer(*client_, data.substr(0, 1 << 19))));
   EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore - 5);
@@ -211,13 +212,44 @@ TEST_P(ClientTest, sizeHintAllocatesAhead) {
   EXPECT_EQ(blockingWait(client_->co_stat(id)).replicas[0].blocks.size(), 3);
 
   // A hint too small: later appends allocate more.
-  writer = blockingWait(client_->co_create({}, 1 << 20));
+  writer = blockingWait(client_->co_create(kDefaultBucket, {}, 1 << 20));
   const auto more = bytes(3 << 20, 8);
   for (size_t done = 0; done < more.size(); done += 1 << 19) {
     blockingWait(writer->co_append(toBuffer(*client_, more.substr(done, 1 << 19))));
   }
   EXPECT_EQ(get(blockingWait(writer->co_commit())), more);
   blockingWait(client_->co_remove(id));
+}
+
+TEST_P(ClientTest, buckets) {
+  const auto& metadata = cluster_->metadata();
+  const auto freeBefore = metadata.freeBlocks(Tier::kDram);
+  const auto job = blockingWait(client_->co_createBucket());
+
+  // The same bytes in a bucket and in none are two chunks.
+  const auto data = bytes(2 << 20, 9);
+  const auto outside = put(data);
+  const auto inside = put(data, {}, 3 << 20, job);
+  EXPECT_NE(inside, outside);
+  EXPECT_EQ(outside, ChunkId::of(folly::StringPiece(data)));
+  const auto other = put(bytes(1 << 20, 10), {}, 3 << 20, job);
+  EXPECT_EQ(get(inside), data);
+
+  EXPECT_TRUE(blockingWait(client_->co_deleteBucket(job)));
+  EXPECT_FALSE(blockingWait(client_->co_deleteBucket(job)));
+  EXPECT_THROW(blockingWait(client_->co_stat(inside)), Error);
+  EXPECT_THROW(blockingWait(client_->co_stat(other)), Error);
+  EXPECT_EQ(get(outside), data);
+
+  // A commit after the bucket is gone fails, and its blocks are freed.
+  try {
+    put(data, {}, 3 << 20, job);
+    FAIL() << "Committed into a deleted bucket";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kNotFound);
+  }
+  blockingWait(client_->co_remove(outside));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), freeBefore);
 }
 
 TEST_P(ClientTest, notFound) {
@@ -233,7 +265,7 @@ TEST_P(ClientTest, notFound) {
 
 TEST_P(ClientTest, outOfSpace) {
   // 2 servers * 2 regions * 16 MiB of DRAM.
-  auto writer = blockingWait(client_->co_create());
+  auto writer = blockingWait(client_->co_create(kDefaultBucket));
   auto buffer = toBuffer(*client_, bytes(65 << 20));
   try {
     blockingWait(writer->co_append(std::move(buffer)));
@@ -250,7 +282,7 @@ TEST_P(ClientTest, concurrentWriters) {
     data.push_back(bytes((i + 1) << 19, i));
   }
   auto write = [&](const std::string& bytes) -> folly::coro::Task<ChunkId> {
-    auto writer = co_await client_->co_create();
+    auto writer = co_await client_->co_create(kDefaultBucket);
     co_await writer->co_append(toBuffer(*client_, bytes));
     co_return co_await writer->co_commit();
   };
