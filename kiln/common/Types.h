@@ -88,9 +88,12 @@ Tier parseTier(const std::string& name);
 
 using RegionId = uint64_t;
 
-// A group of chunks that are removed together, e.g. those of one job.
+// A group of chunks that are removed together, e.g. those of one job (see
+// rpc::MetadataRpc::co_createBucket). Every chunk is in one. The default
+// bucket always exists and cannot be deleted: its chunks stay until they
+// are removed or evicted.
 using BucketId = uint64_t;
-constexpr BucketId kNoBucket = 0;
+constexpr BucketId kDefaultBucket = 0;
 
 // Reaching a region with the storage server's TCP service.
 struct TcpAccess {
@@ -152,17 +155,10 @@ struct BlockRef {
 // goes into 'tier' if its first allocation fits into the free blocks there
 // without evicting anything, else into 'overflow' as a whole, which evicts
 // as usual. The committed chunk's placement names the tier it went to.
-//
-// With 'bucket' set, the chunk goes into that bucket, which must exist when
-// it is committed (see rpc::MetadataRpc::co_createBucket). The bucket is
-// hashed into the chunk's id, so equal bytes in two buckets are two chunks.
 struct Placement {
   Tier tier{Tier::kDram};
   std::optional<Tier> writeThrough;
   std::optional<Tier> overflow;
-  // Trivially destructible, like the rest: GCC 12 destroys temporaries in a
-  // co_await's arguments twice, and placements are often such temporaries.
-  BucketId bucket{kNoBucket};
 
   bool operator==(const Placement&) const = default;
 };
@@ -180,6 +176,9 @@ struct Replica {
 // copy in one tier; the chunk is gone when it has none left.
 struct ChunkInfo {
   ChunkId id;
+  // Hashed into the id with the bytes (except the default bucket), so equal
+  // bytes in two buckets are two chunks.
+  BucketId bucket{kDefaultBucket};
   uint64_t size{0};
   Placement placement;
   std::vector<Replica> replicas;

@@ -85,8 +85,8 @@ TEST_F(RdmaMetadataTest, makesAllCalls) {
   EXPECT_EQ(errorOf(client_->co_lookup(chunk.id)), ErrorCode::kNotFound);
 
   const auto job = blockingWait(client_->co_createBucket());
-  EXPECT_NE(job, kNoBucket);
-  chunk.placement.bucket = job;
+  EXPECT_NE(job, kDefaultBucket);
+  chunk.bucket = job;
   chunk.replicas[0].blocks = blockingWait(client_->co_allocate(Tier::kDram, 3));
   chunk.replicas[0].blocks.back().length = 100;
   EXPECT_EQ(blockingWait(client_->co_commit(chunk)), chunk);

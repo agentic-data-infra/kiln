@@ -205,7 +205,7 @@ folly::coro::Task<bool> Catalog::co_putMemo(
     std::string key,
     Manifest manifest) {
   auto data = encodeManifest(key, manifest);
-  auto writer = co_await client_.co_create(options_.placement);
+  auto writer = co_await client_.co_create(kDefaultBucket, options_.placement);
   auto buffer = client_.registerMemory(data.data(), data.size());
   buffer.setSize(data.size());
   co_await writer->co_append(std::move(buffer));

@@ -37,7 +37,7 @@ std::string text(const Buffer& buffer, size_t offset, size_t length) {
 
 folly::coro::Task<void> co_run(client::Client& client) {
   const auto size = FLAGS_records * kRecordSize;
-  auto writer = co_await client.co_create();
+  auto writer = co_await client.co_create(kDefaultBucket);
   auto buffer = client.allocateBuffer(size);
   for (int64_t i = 0; i < FLAGS_records; ++i) {
     formatRecord(i, buffer.data() + i * kRecordSize);

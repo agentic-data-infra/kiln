@@ -119,6 +119,7 @@ ClientStats Client::stats() const {
 }
 
 folly::coro::Task<std::unique_ptr<ChunkWriter>> Client::co_create(
+    BucketId bucket,
     Placement placement,
     uint64_t sizeHint) {
   if (!hasBlocks(placement.tier) || placement.writeThrough == placement.tier) {
@@ -143,7 +144,7 @@ folly::coro::Task<std::unique_ptr<ChunkWriter>> Client::co_create(
         "Writing through to the object store needs one in ClientOptions");
   }
   co_return std::unique_ptr<ChunkWriter>(
-      new ChunkWriter(*this, placement, sizeHint));
+      new ChunkWriter(*this, bucket, placement, sizeHint));
 }
 
 folly::coro::Task<Buffer>
@@ -262,7 +263,7 @@ folly::coro::Task<bool> Client::co_deleteBucket(
   {
     std::lock_guard lock(mutex_);
     std::erase_if(chunks_, [&](const auto& entry) {
-      return entry.second.info.placement.bucket == bucket;
+      return entry.second.info.bucket == bucket;
     });
   }
   co_return co_await metadata_->co_deleteBucket(bucket, grace);
@@ -366,16 +367,21 @@ void Client::cacheChunk(const ChunkInfo& chunk) {
       .expires = std::chrono::steady_clock::now() + options_.chunkCacheTtl};
 }
 
-ChunkWriter::ChunkWriter(Client& client, Placement placement, uint64_t sizeHint)
+ChunkWriter::ChunkWriter(
+    Client& client,
+    BucketId bucket,
+    Placement placement,
+    uint64_t sizeHint)
     : client_{client},
+      bucket_{bucket},
       placement_{placement},
       sizeHint_{sizeHint},
       hasher_{std::make_unique<ChunkHasher>()} {
-  if (placement.bucket != kNoBucket) {
+  if (bucket != kDefaultBucket) {
     // The id covers the bucket's id, little endian, then the chunk's bytes.
-    const auto bucket = folly::Endian::little(placement.bucket);
+    const auto id = folly::Endian::little(bucket);
     hasher_->update(folly::ByteRange(
-        reinterpret_cast<const uint8_t*>(&bucket), sizeof(bucket)));
+        reinterpret_cast<const uint8_t*>(&id), sizeof(id)));
   }
   replicas_.push_back(Replica{.tier = placement.tier});
   if (placement.writeThrough && hasBlocks(*placement.writeThrough)) {
@@ -504,6 +510,7 @@ folly::coro::Task<ChunkId> ChunkWriter::co_commit() {
   // arguments twice.
   ChunkInfo committing{
       .id = id,
+      .bucket = bucket_,
       .size = size_,
       .placement = placement_,
       .replicas = std::move(replicas)};

@@ -33,7 +33,7 @@ class EvictionTest : public testing::Test {
             .chunkCacheTtl = 50ms}} {}
 
   ChunkId put(char fill, size_t size) {
-    auto writer = blockingWait(client_.co_create());
+    auto writer = blockingWait(client_.co_create(kDefaultBucket));
     auto buffer = client_.allocateBuffer(size);
     std::memset(buffer.data(), fill, size);
     buffer.setSize(size);
@@ -122,7 +122,7 @@ TEST(OverflowTest, wholeChunksOverflowWithoutEvicting) {
   std::vector<ChunkId> ids;
   for (char fill = 'a'; fill < 'e'; ++fill) {
     const size_t size = 3 << 20;
-    auto writer = blockingWait(client.co_create(placement, size));
+    auto writer = blockingWait(client.co_create(kDefaultBucket, placement, size));
     auto buffer = client.allocateBuffer(size);
     std::memset(buffer.data(), fill, size);
     buffer.setSize(size);
@@ -144,6 +144,7 @@ TEST(OverflowTest, wholeChunksOverflowWithoutEvicting) {
 
   EXPECT_THROW(
       blockingWait(client.co_create(
+          kDefaultBucket,
           Placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs,
                     .overflow = Tier::kLocalFs})),
       Error);

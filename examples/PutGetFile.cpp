@@ -39,7 +39,7 @@ folly::coro::Task<void> co_run(client::Client& client, const std::string& path) 
   // Write: append the file in pieces, reusing one buffer.
   auto start = std::chrono::steady_clock::now();
   auto writer =
-      co_await client.co_create(Placement{.tier = parseTier(FLAGS_tier)});
+      co_await client.co_create(kDefaultBucket, {.tier = parseTier(FLAGS_tier)});
   auto buffer = client.allocateBuffer(kPieceSize);
   while (file) {
     file.read(reinterpret_cast<char*>(buffer.data()), buffer.capacity());

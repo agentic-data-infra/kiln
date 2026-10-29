@@ -34,11 +34,12 @@ ChunkId commit(
     uint64_t id,
     uint32_t blocks,
     Tier tier = Tier::kDram,
-    BucketId bucket = kNoBucket) {
+    BucketId bucket = kDefaultBucket) {
   ChunkInfo chunk{
       .id = ChunkId{id, id},
+      .bucket = bucket,
       .size = blocks * kBlockSize,
-      .placement = Placement{.tier = tier, .bucket = bucket},
+      .placement = Placement{.tier = tier},
       .replicas = {Replica{
           .tier = tier,
           .blocks = blockingWait(metadata.co_allocate(tier, blocks))}}};
@@ -453,12 +454,17 @@ TEST(MetadataTest, bucketsRemoveTheirChunks) {
   Metadata metadata(exact());
   registerServer(metadata, "a:1", Tier::kDram, {8});
   const auto job = blockingWait(metadata.co_createBucket());
-  EXPECT_NE(job, kNoBucket);
+  EXPECT_NE(job, kDefaultBucket);
   EXPECT_NE(blockingWait(metadata.co_createBucket()), job);
   const auto a = commit(metadata, 1, 2, Tier::kDram, job);
   const auto b = commit(metadata, 2, 2, Tier::kDram, job);
   const auto outside = commit(metadata, 3, 2);
-  EXPECT_EQ(blockingWait(metadata.co_lookup(a)).placement.bucket, job);
+  EXPECT_EQ(blockingWait(metadata.co_lookup(a)).bucket, job);
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_deleteBucket(kDefaultBucket);
+      }()),
+      ErrorCode::kInvalidArgument);
 
   EXPECT_TRUE(blockingWait(metadata.co_deleteBucket(job)));
   EXPECT_FALSE(blockingWait(metadata.co_deleteBucket(job)));
@@ -531,11 +537,9 @@ TEST(MetadataTest, bucketsSurviveRestartWithJournal) {
     blockingWait(metadata.co_deleteBucket(gone));
     ChunkInfo info{
         .id = ChunkId{1, 1},
+        .bucket = job,
         .size = kBlockSize,
-        .placement =
-            {.tier = Tier::kDram,
-             .writeThrough = Tier::kObjectStore,
-             .bucket = job},
+        .placement = {.tier = Tier::kDram, .writeThrough = Tier::kObjectStore},
         .replicas = {
             Replica{
                 .tier = Tier::kDram,

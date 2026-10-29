@@ -98,7 +98,6 @@ thrift::Placement toThrift(const Placement& placement) {
   if (placement.writeThrough) {
     result.writeThrough() = static_cast<thrift::Tier>(*placement.writeThrough);
   }
-  result.bucket() = static_cast<int64_t>(placement.bucket);
   return result;
 }
 
@@ -107,7 +106,6 @@ Placement fromThrift(const thrift::Placement& placement) {
   if (placement.writeThrough()) {
     result.writeThrough = static_cast<Tier>(*placement.writeThrough());
   }
-  result.bucket = static_cast<BucketId>(*placement.bucket());
   return result;
 }
 
@@ -130,12 +128,14 @@ thrift::ChunkInfo toThrift(const ChunkInfo& chunk) {
   result.size() = static_cast<int64_t>(chunk.size);
   result.placement() = toThrift(chunk.placement);
   result.replicas() = toThrift(chunk.replicas);
+  result.bucket() = static_cast<int64_t>(chunk.bucket);
   return result;
 }
 
 ChunkInfo fromThrift(const thrift::ChunkInfo& chunk) {
   return ChunkInfo{
       .id = fromThrift(*chunk.id()),
+      .bucket = static_cast<BucketId>(*chunk.bucket()),
       .size = static_cast<uint64_t>(*chunk.size()),
       .placement = fromThrift(*chunk.placement()),
       .replicas = fromThrift(*chunk.replicas())};

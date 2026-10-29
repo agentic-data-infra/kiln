@@ -42,7 +42,7 @@ class MetadataRpc {
   // Returns blocks from co_allocate that no chunk uses.
   virtual folly::coro::Task<void> co_free(std::vector<BlockRef> blocks) = 0;
 
-  // Makes a chunk visible. A chunk for a bucket that does not exist fails
+  // Makes a chunk visible. A chunk in a bucket that does not exist fails
   // with kNotFound, and its blocks are freed. Its replicas are its copies in the placement's
   // tier and write-through tier, in that order. The first commit of an id
   // wins: a later one gets the first one's chunk back, with its own copies
@@ -59,11 +59,12 @@ class MetadataRpc {
   // period, so readers that looked it up just before can still finish.
   virtual folly::coro::Task<bool> co_remove(ChunkId id) = 0;
 
-  // A new bucket, for chunks to remove together (Placement::bucket). Ids
+  // A new bucket, for chunks to remove together (ChunkInfo::bucket). Ids
   // are never reused.
   virtual folly::coro::Task<BucketId> co_createBucket() = 0;
 
-  // Removes the bucket and its chunks and returns whether it existed. Later
+  // Removes the bucket and its chunks and returns whether it existed; fails
+  // with kInvalidArgument for the default bucket. Later
   // commits into it fail with kNotFound. Their blocks are reusable after
   // 'grace' (at most the metadata server's grace period; see co_remove), by
   // default at once: the caller knows that nobody reads the chunks anymore.
