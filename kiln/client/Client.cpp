@@ -256,14 +256,16 @@ folly::coro::Task<BucketId> Client::co_createBucket() {
   co_return co_await metadata_->co_createBucket();
 }
 
-folly::coro::Task<bool> Client::co_deleteBucket(BucketId bucket) {
+folly::coro::Task<bool> Client::co_deleteBucket(
+    BucketId bucket,
+    std::chrono::milliseconds grace) {
   {
     std::lock_guard lock(mutex_);
     std::erase_if(chunks_, [&](const auto& entry) {
       return entry.second.info.placement.bucket == bucket;
     });
   }
-  co_return co_await metadata_->co_deleteBucket(bucket);
+  co_return co_await metadata_->co_deleteBucket(bucket, grace);
 }
 
 folly::coro::Task<std::optional<Ref>> Client::co_getRef(std::string name) {

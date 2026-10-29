@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -62,9 +63,13 @@ class MetadataRpc {
   // are never reused.
   virtual folly::coro::Task<BucketId> co_createBucket() = 0;
 
-  // Removes the bucket and its chunks, as co_remove does, and returns
-  // whether it existed. Later commits into it fail with kNotFound.
-  virtual folly::coro::Task<bool> co_deleteBucket(BucketId bucket) = 0;
+  // Removes the bucket and its chunks and returns whether it existed. Later
+  // commits into it fail with kNotFound. Their blocks are reusable after
+  // 'grace' (at most the metadata server's grace period; see co_remove), by
+  // default at once: the caller knows that nobody reads the chunks anymore.
+  virtual folly::coro::Task<bool> co_deleteBucket(
+      BucketId bucket,
+      std::chrono::milliseconds grace = {}) = 0;
 
   // The ref, or nullopt if there is none.
   virtual folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) = 0;

@@ -111,9 +111,14 @@ class MetadataService
         co_await guarded(metadata_->co_createBucket()));
   }
 
-  folly::coro::Task<bool> co_deleteBucket(int64_t bucket) override {
-    co_return co_await guarded(
-        metadata_->co_deleteBucket(static_cast<BucketId>(bucket)));
+  folly::coro::Task<bool> co_deleteBucket(
+      int64_t bucket,
+      int64_t graceMs) override {
+    if (graceMs < 0) {
+      throw toThrift(Error(ErrorCode::kInvalidArgument, "Negative grace"));
+    }
+    co_return co_await guarded(metadata_->co_deleteBucket(
+        static_cast<BucketId>(bucket), std::chrono::milliseconds(graceMs)));
   }
 
   folly::coro::Task<std::unique_ptr<thrift::RefLookup>> co_getRef(

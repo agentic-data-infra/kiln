@@ -478,6 +478,32 @@ TEST(MetadataTest, bucketsRemoveTheirChunks) {
   EXPECT_FALSE(exists(metadata, ChunkId{4, 4}));
 }
 
+TEST(MetadataTest, deletedBucketsSkipTheGracePeriod) {
+  Metadata metadata(MetadataOptions{
+      .gracePeriod = 30s, .evictBelow = 0, .evictUntil = 0});
+  registerServer(metadata, "a:1", Tier::kDram, {8});
+  // Removed: its blocks wait out the 30 s.
+  EXPECT_TRUE(blockingWait(metadata.co_remove(commit(metadata, 1, 2))));
+  const auto now = blockingWait(metadata.co_createBucket());
+  commit(metadata, 2, 2, Tier::kDram, now);
+  const auto soon = blockingWait(metadata.co_createBucket());
+  commit(metadata, 3, 2, Tier::kDram, soon);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 2);
+
+  // By default, at once.
+  blockingWait(metadata.co_deleteBucket(now));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 4);
+  EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 2);
+
+  // A short grace: reusable before the removed chunk's blocks.
+  blockingWait(metadata.co_deleteBucket(soon, 20ms));
+  EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 4);
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(blockingWait(metadata.co_allocate(Tier::kDram, 6)).size(), 6);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 5s);
+  EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 2);
+}
+
 TEST(MetadataTest, evictedChunksLeaveTheirBucket) {
   Metadata metadata(exact());
   registerServer(metadata, "a:1", Tier::kDram, {4});

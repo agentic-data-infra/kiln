@@ -99,9 +99,12 @@ folly::coro::Task<std::string> co_dispatch(
     case MetadataOp::kCreateBucket:
       out.u64(co_await metadata.co_createBucket());
       break;
-    case MetadataOp::kDeleteBucket:
-      out.u8(co_await metadata.co_deleteBucket(in.u64()));
+    case MetadataOp::kDeleteBucket: {
+      const auto bucket = in.u64();
+      const std::chrono::milliseconds grace(in.u64());
+      out.u8(co_await metadata.co_deleteBucket(bucket, grace));
       break;
+    }
     default:
       throw Error(ErrorCode::kInvalidArgument, "Unknown metadata call");
   }
@@ -275,9 +278,13 @@ class RdmaMetadataClient : public rpc::MetadataRpc {
     co_return readResponse(response).u64();
   }
 
-  folly::coro::Task<bool> co_deleteBucket(BucketId bucket) override {
+  folly::coro::Task<bool> co_deleteBucket(
+      BucketId bucket,
+      std::chrono::milliseconds grace) override {
     MessageWriter request;
-    request.u8(static_cast<uint8_t>(MetadataOp::kDeleteBucket)).u64(bucket);
+    request.u8(static_cast<uint8_t>(MetadataOp::kDeleteBucket))
+        .u64(bucket)
+        .u64(static_cast<uint64_t>(std::max<int64_t>(grace.count(), 0)));
     const auto response = co_await co_call(std::move(request));
     co_return readResponse(response).u8() != 0;
   }

@@ -185,6 +185,9 @@ A bucket groups chunks that are removed together, e.g. those one job
 writes. `co_createBucket()` returns a new bucket's id (ids are never
 reused), chunks created with `Placement::bucket` set go into it, and
 `co_deleteBucket(id)` removes the bucket and all its chunks in one call.
+Their blocks are reusable at once, not after the grace period (see
+Eviction): the caller knows nobody reads them anymore. `co_deleteBucket(id,
+grace)` waits `grace` (at most the grace period) instead.
 A commit into a bucket that does not exist, e.g. by a late task of a job
 whose bucket is deleted already, fails with `kNotFound` and frees the
 chunk's blocks. The bucket is hashed into a chunk's id, so equal bytes in

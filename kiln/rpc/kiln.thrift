@@ -165,8 +165,11 @@ service MetadataService {
   /// A new bucket's id.
   i64 createBucket() throws (1: KilnException e);
 
-  /// Removes the bucket and its chunks; returns whether it existed.
-  bool deleteBucket(1: i64 bucket) throws (1: KilnException e);
+  /// Removes the bucket and its chunks, whose blocks are reusable after
+  /// 'graceMs'; returns whether it existed.
+  bool deleteBucket(1: i64 bucket, 2: i64 graceMs) throws (
+    1: KilnException e,
+  );
 
   RefLookup getRef(1: string name) throws (1: KilnException e);
 

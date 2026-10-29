@@ -607,8 +607,21 @@ folly::coro::Task<void> Metadata::co_free(std::vector<BlockRef> blocks) {
   co_return;
 }
 
-void Metadata::freeLocked(const std::vector<BlockRef>& blocks, bool grace) {
-  const auto reusableAt = Clock::now() + options_.gracePeriod;
+void Metadata::freeLocked(
+    const std::vector<BlockRef>& blocks,
+    bool grace,
+    std::optional<Clock::duration> period) {
+  if (period.has_value()) {
+    period = std::min<Clock::duration>(*period, options_.gracePeriod);
+    grace = grace && period->count() > 0;
+  }
+  const auto reusableAt = Clock::now() + period.value_or(options_.gracePeriod);
+  // Before the blocks freed with a longer period, if any.
+  auto at = std::upper_bound(
+      grace_.begin(),
+      grace_.end(),
+      reusableAt,
+      [](Clock::time_point t, const GraceBlock& b) { return t < b.reusableAt; });
   for (const auto& block : blocks) {
     auto* server = serverOf(block.region);
     if (server == nullptr) {
@@ -617,7 +630,8 @@ void Metadata::freeLocked(const std::vector<BlockRef>& blocks, bool grace) {
     --server->liveBlocks;
     if (grace) {
       ++server->graceBlocks;
-      grace_.push_back(GraceBlock{.block = block, .reusableAt = reusableAt});
+      at = std::next(grace_.insert(
+          at, GraceBlock{.block = block, .reusableAt = reusableAt}));
     } else {
       regions_.at(block.region).free.push_back(block.offset);
     }
@@ -642,7 +656,8 @@ void Metadata::addReplicaLocked(Chunk& chunk, Replica replica) {
 
 Metadata::ChunkMap::iterator Metadata::dropReplicaLocked(
     ChunkMap::iterator chunk,
-    Tier tier) {
+    Tier tier,
+    std::optional<Clock::duration> period) {
   auto& info = chunk->second.info;
   auto replica = std::find_if(
       info.replicas.begin(), info.replicas.end(), [&](const Replica& r) {
@@ -653,7 +668,7 @@ Metadata::ChunkMap::iterator Metadata::dropReplicaLocked(
   }
   if (hasBlocks(tier)) {
     lruOf(tier).erase(chunk->second.lru[static_cast<size_t>(tier)]);
-    freeLocked(replica->blocks, /*grace=*/true);
+    freeLocked(replica->blocks, /*grace=*/true, period);
   }
   if (info.placement.writeThrough == tier) {
     append(RecordWriter().u8(kChunkRemoved).u64(info.id.high).u64(info.id.low));
@@ -669,14 +684,16 @@ Metadata::ChunkMap::iterator Metadata::dropReplicaLocked(
   return std::next(chunk);
 }
 
-void Metadata::eraseChunkLocked(ChunkMap::iterator chunk) {
+void Metadata::eraseChunkLocked(
+    ChunkMap::iterator chunk,
+    std::optional<Clock::duration> period) {
   std::vector<Tier> tiers;
   for (const auto& replica : chunk->second.info.replicas) {
     tiers.push_back(replica.tier);
   }
   // The last drop erases the chunk.
   for (auto tier : tiers) {
-    dropReplicaLocked(chunk, tier);
+    dropReplicaLocked(chunk, tier, period);
   }
 }
 
@@ -845,7 +862,9 @@ folly::coro::Task<BucketId> Metadata::co_createBucket() {
   co_return bucket;
 }
 
-folly::coro::Task<bool> Metadata::co_deleteBucket(BucketId id) {
+folly::coro::Task<bool> Metadata::co_deleteBucket(
+    BucketId id,
+    std::chrono::milliseconds grace) {
   std::lock_guard lock(mutex_);
   auto bucket = buckets_.find(id);
   if (bucket == buckets_.end()) {
@@ -856,7 +875,7 @@ folly::coro::Task<bool> Metadata::co_deleteBucket(BucketId id) {
   for (const auto& id : ids) {
     auto it = chunks_.find(id);
     if (it != chunks_.end()) {
-      eraseChunkLocked(it);
+      eraseChunkLocked(it, grace);
     }
   }
   buckets_.erase(bucket);

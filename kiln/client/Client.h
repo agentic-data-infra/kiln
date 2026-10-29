@@ -127,9 +127,12 @@ class Client {
   // A new bucket, for chunks to remove together (see Placement::bucket).
   folly::coro::Task<BucketId> co_createBucket();
 
-  // Removes the bucket and its chunks, as co_remove does; returns whether
-  // it existed.
-  folly::coro::Task<bool> co_deleteBucket(BucketId bucket);
+  // Removes the bucket and its chunks; returns whether it existed. Their
+  // blocks are reusable after 'grace' (see rpc::MetadataRpc), by default
+  // at once.
+  folly::coro::Task<bool> co_deleteBucket(
+      BucketId bucket,
+      std::chrono::milliseconds grace = {});
 
   // Refs: small named values on the metadata server, updated with compare
   // and swap (see Ref and rpc::MetadataRpc).
