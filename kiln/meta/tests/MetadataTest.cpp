@@ -204,6 +204,19 @@ TEST(MetadataTest, commitChecksBlocks) {
         co_await metadata.co_commit(wrongTier);
       }()),
       ErrorCode::kInvalidArgument);
+  // Writing through to DRAM would journal a copy that a restart loses.
+  ChunkInfo notDurable{
+      .id = ChunkId{1, 2},
+      .size = kBlockSize,
+      .placement = Placement{.tier = Tier::kLocalFs, .writeThrough = Tier::kDram},
+      .replicas = {
+          Replica{.tier = Tier::kDram, .blocks = blocks},
+          Replica{.tier = Tier::kLocalFs, .blocks = blocks}}};
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_commit(notDurable);
+      }()),
+      ErrorCode::kInvalidArgument);
 }
 
 TEST(MetadataTest, evictsLeastRecentlyUsed) {

@@ -700,7 +700,8 @@ void Metadata::eraseChunkLocked(
 folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
   std::lock_guard lock(mutex_);
   const auto& placement = chunk.placement;
-  if (!hasBlocks(placement.tier) || placement.writeThrough == placement.tier) {
+  if (!hasBlocks(placement.tier) || placement.writeThrough == placement.tier ||
+      (placement.writeThrough && !isDurable(*placement.writeThrough))) {
     throw Error(
         ErrorCode::kInvalidArgument,
         fmt::format(

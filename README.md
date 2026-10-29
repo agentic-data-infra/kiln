@@ -30,8 +30,8 @@ The catalog keeps memos of results (below).
 
 A chunk goes into DRAM or the local FS (`Placement::tier`), and, if
 `Placement::writeThrough` is set, also into a second tier before its commit
-returns: the local FS, or the object store (`ClientOptions::objectStore`),
-where it is the object `chunks/<id>`. The client writes both copies, and
+returns: a durable tier (`isDurable`), the local FS, or the object store
+(`ClientOptions::objectStore`), where it is the object `chunks/<id>`. The client writes both copies, and
 reads the fastest one it can reach (`co_stat` lists them).
 
 ```cpp

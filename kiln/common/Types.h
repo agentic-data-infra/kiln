@@ -80,6 +80,12 @@ inline bool hasBlocks(Tier tier) {
   return tier != Tier::kObjectStore;
 }
 
+// Whether the tier keeps chunks across restarts, so it can be a
+// write-through target.
+inline bool isDurable(Tier tier) {
+  return tier != Tier::kDram;
+}
+
 const char* toString(Tier tier);
 
 // Parses "dram", "localfs" or "objectstore". Throws Error(kInvalidArgument)
@@ -147,7 +153,7 @@ struct BlockRef {
 };
 
 // Where a new chunk goes: into 'tier' (DRAM or local FS), and, if set, also
-// into 'writeThrough' before its commit returns. The metadata server
+// into 'writeThrough', a durable tier (isDurable), before its commit returns. The metadata server
 // journals a written-through chunk's copy in its target tier, so with a
 // local FS or object store target, the chunk outlives restarts.
 //
