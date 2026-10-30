@@ -301,6 +301,7 @@ kiln ref set head $other_id VERSION     # only if head is still at VERSION
 kiln ref get head
 kiln ref ls
 kiln --write_through=localfs data put some/dir input  # a dataset of the directory's files
+                                        # (and its manifest) in DRAM + local FS
 kiln data ls                            # datasets: name, version, files, bytes
 kiln data ls input                      # its files: name, size, chunk
 kiln data get input/part-00000 copy     # one file; data get input DIR for all
