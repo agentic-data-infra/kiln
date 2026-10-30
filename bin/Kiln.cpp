@@ -53,11 +53,12 @@ DEFINE_string(
     metadata,
     "",
     "The metadata server's URLs, e.g. tcp://host:7470,rdma://10.0.0.1:7471.");
-DEFINE_string(tier, "dram", "Where put stores the chunk: dram or localfs.");
+DEFINE_string(tier, "dram", "Where put and data put store chunks and manifests: dram or localfs.");
 DEFINE_string(
     write_through,
     "",
-    "Where put also stores the chunk: localfs or objectstore; none if empty.");
+    "Where put and data put also store them: localfs or objectstore; none "
+    "if empty.");
 DEFINE_string(
     object_store,
     "",
@@ -364,7 +365,10 @@ folly::coro::Task<int> co_dataGet(
 folly::coro::Task<int> co_data(
     client::Client& client,
     const std::vector<std::string>& args) {
-  catalog::Catalog catalog(client);
+  // Manifests go where the files go: the catalog's default writes them
+  // through to the local FS, which a cluster without a local-FS server lacks.
+  catalog::Catalog catalog(
+      client, catalog::CatalogOptions{.placement = placementFromFlags()});
   const std::string command = args.size() > 1 ? args[1] : "";
   if (command == "put" && args.size() == 4) {
     co_return co_await co_dataPut(client, catalog, args[2], args[3]);
