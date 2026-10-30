@@ -13,7 +13,8 @@ namespace {
 
 // Encoded manifests start with this and their format version.
 constexpr char kMagic[4] = {'K', 'M', 'F', 'T'};
-constexpr uint32_t kVersion = 1;
+// Version 1 had no entry names, kinds, rows nor bucket.
+constexpr uint32_t kVersion = 2;
 
 class Writer {
  public:
@@ -89,13 +90,18 @@ std::string encodeManifest(const std::string& key, const Manifest& manifest) {
       .string(manifest.schema)
       .u64(manifest.rows)
       .u64(manifest.bytes)
+      .u64(manifest.bucket)
       .u64(manifest.chunks.size());
   for (const auto& range : manifest.chunks) {
-    writer.u64(range.id.high)
+    writer.u32(static_cast<uint32_t>(range.kind))
+        .string(range.name)
+        .u64(range.id.high)
         .u64(range.id.low)
         .u64(range.offset)
         .u32(range.length ? 1 : 0)
-        .u64(range.length.value_or(0));
+        .u64(range.length.value_or(0))
+        .u32(range.rows ? 1 : 0)
+        .u64(range.rows.value_or(0));
   }
   writer.u64(manifest.properties.size());
   for (const auto& [name, value] : manifest.properties) {
@@ -109,7 +115,8 @@ std::pair<std::string, Manifest> decodeManifest(folly::ByteRange data) {
   if (memcmp(reader.take(sizeof(kMagic)).data(), kMagic, sizeof(kMagic)) != 0) {
     throw Error(ErrorCode::kInvalidArgument, "Not a manifest");
   }
-  if (const auto version = reader.u32(); version != kVersion) {
+  const auto version = reader.u32();
+  if (version != 1 && version != kVersion) {
     throw Error(
         ErrorCode::kInvalidArgument,
         fmt::format("Manifest of unknown version {}", version));
@@ -119,15 +126,35 @@ std::pair<std::string, Manifest> decodeManifest(folly::ByteRange data) {
   manifest.schema = reader.string();
   manifest.rows = reader.u64();
   manifest.bytes = reader.u64();
+  if (version >= 2) {
+    manifest.bucket = reader.u64();
+  }
+  // Reads a flag and a value: the value if the flag is set.
+  auto optional = [&]() -> std::optional<uint64_t> {
+    const bool present = reader.u32() != 0;
+    const auto value = reader.u64();
+    return present ? std::optional<uint64_t>(value) : std::nullopt;
+  };
   for (auto n = reader.u64(); n > 0; --n) {
-    ChunkRange range{.id = {.high = reader.u64(), .low = reader.u64()}};
-    range.offset = reader.u64();
-    const bool hasLength = reader.u32() != 0;
-    const auto length = reader.u64();
-    if (hasLength) {
-      range.length = length;
+    ChunkRange range;
+    if (version >= 2) {
+      const auto kind = reader.u32();
+      if (kind > static_cast<uint32_t>(EntryKind::kManifest)) {
+        throw Error(
+            ErrorCode::kInvalidArgument,
+            fmt::format("Manifest entry of unknown kind {}", kind));
+      }
+      range.kind = static_cast<EntryKind>(kind);
+      range.name = reader.string();
     }
-    manifest.chunks.push_back(range);
+    range.id.high = reader.u64();
+    range.id.low = reader.u64();
+    range.offset = reader.u64();
+    range.length = optional();
+    if (version >= 2) {
+      range.rows = optional();
+    }
+    manifest.chunks.push_back(std::move(range));
   }
   for (auto n = reader.u64(); n > 0; --n) {
     auto name = reader.string();
@@ -201,7 +228,7 @@ folly::coro::Task<std::optional<Manifest>> Catalog::co_getMemo(
   co_return manifest;
 }
 
-folly::coro::Task<bool> Catalog::co_putMemo(
+folly::coro::Task<ChunkId> Catalog::co_writeManifest(
     std::string key,
     Manifest manifest) {
   auto data = encodeManifest(key, manifest);
@@ -209,7 +236,13 @@ folly::coro::Task<bool> Catalog::co_putMemo(
   auto buffer = client_.registerMemory(data.data(), data.size());
   buffer.setSize(data.size());
   co_await writer->co_append(std::move(buffer));
-  const auto id = co_await writer->co_commit();
+  co_return co_await writer->co_commit();
+}
+
+folly::coro::Task<bool> Catalog::co_putMemo(
+    std::string key,
+    Manifest manifest) {
+  const auto id = co_await co_writeManifest(key, std::move(manifest));
   // Create-only: an existing memo wins. Its manifest may be this very
   // chunk (same key and manifest), so this one stays.
   const auto ref =
@@ -219,6 +252,90 @@ folly::coro::Task<bool> Catalog::co_putMemo(
 
 folly::coro::Task<bool> Catalog::co_removeMemo(std::string key) {
   co_return co_await client_.co_removeRef(refName(key));
+}
+
+std::string Catalog::datasetRefName(const std::string& name) const {
+  auto refName = options_.datasetRefPrefix + name;
+  if (name.empty() || name.find('/') != std::string::npos ||
+      refName.size() > kMaxRefNameSize) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format("Bad dataset name '{}'", name));
+  }
+  return refName;
+}
+
+folly::coro::Task<std::optional<Dataset>> Catalog::co_getDataset(
+    std::string name) {
+  const auto refName = datasetRefName(name);
+  const auto ref = co_await client_.co_getRef(refName);
+  if (!ref) {
+    co_return std::nullopt;
+  }
+  const auto id = ChunkId::parse(ref->value);
+  const auto size = (co_await client_.co_stat(id)).size;
+  auto data = co_await client_.co_read(
+      id, 0, size, client_.allocateBuffer(std::max<uint64_t>(size, 1)));
+  auto [storedName, manifest] = decodeManifest(data.bytes());
+  if (storedName != name) {
+    throw Error(
+        ErrorCode::kInvalidArgument,
+        fmt::format("Ref {} points at the manifest of {}", refName, storedName));
+  }
+  Dataset dataset{
+      .name = std::move(name),
+      .version = ref->version,
+      .manifestId = id,
+      .manifest = std::move(manifest)};
+  co_return dataset;
+}
+
+folly::coro::Task<std::optional<uint64_t>> Catalog::co_publishDataset(
+    std::string name,
+    Manifest manifest,
+    std::optional<uint64_t> expectedVersion) {
+  const auto refName = datasetRefName(name);
+  const auto id = co_await co_writeManifest(name, std::move(manifest));
+  const auto ref =
+      co_await client_.co_casRef(refName, expectedVersion, id.toString());
+  if (!ref) {
+    // Unless the current version is this very manifest.
+    const auto current = co_await client_.co_getRef(refName);
+    if (!current || current->value != id.toString()) {
+      co_await client_.co_remove(id);
+    }
+    co_return std::nullopt;
+  }
+  co_return ref->version;
+}
+
+folly::coro::Task<std::vector<std::string>> Catalog::co_listDatasets(
+    std::string prefix) {
+  std::vector<std::string> names;
+  const auto refPrefix = options_.datasetRefPrefix + prefix;
+  for (const auto& ref : co_await client_.co_listRefs(refPrefix)) {
+    names.push_back(ref.name.substr(options_.datasetRefPrefix.size()));
+  }
+  co_return names;
+}
+
+folly::coro::Task<bool> Catalog::co_deleteDataset(std::string name) {
+  for (;;) {
+    auto dataset = co_await co_getDataset(name);
+    if (!dataset) {
+      co_return false;
+    }
+    // Only this version: a new one published meanwhile is read again.
+    const auto refName = datasetRefName(name);
+    if (!co_await client_.co_removeRef(refName, dataset->version)) {
+      continue;
+    }
+    if (dataset->manifest.bucket != kDefaultBucket) {
+      co_await client_.co_deleteBucket(dataset->manifest.bucket);
+    }
+    co_await client_.co_remove(dataset->manifestId);
+    co_return true;
+  }
 }
 
 } // namespace kiln::catalog
