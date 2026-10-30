@@ -24,7 +24,7 @@ regions, in a build with RDMA), or, on the same host, by mapping their
 files. Tiers fill up to the storage servers' byte budgets and
 then evict their least recently used chunks. Chunks can be written through
 to a durable tier, and refs and written-through chunks survive restarts.
-The catalog keeps memos of results (below).
+The catalog keeps memos of results and datasets of named files (below).
 
 ## Tiers and write-through
 
@@ -250,6 +250,24 @@ so the result is recomputed and memoed again. `examples/memo_restart.sh`
 shows a memo of written-through data surviving a cluster restart, and one of
 DRAM-only data turning into a miss.
 
+## Datasets
+
+A dataset is a name for versions of a set of named files, e.g. a job's
+input or output. It is the ref `data/<name>` pointing at a manifest whose
+entries are the files: each a name, a chunk and its length. The catalog
+publishes a new version by writing a new manifest and swapping the ref
+(`co_publishDataset(name, manifest, expectedVersion)`; without a version it
+only creates), so readers see a whole version or none, and a job's output
+becomes visible at once when its driver publishes it. A manifest may name a
+bucket that holds the dataset's chunks; `co_deleteDataset` removes the ref
+and deletes that bucket and the manifest. Dataset names are one path
+segment. Older versions' manifests and chunks stay until removed.
+
+An entry can also point at another manifest (`EntryKind::kManifest`), e.g.
+for a sub-directory; the format has them, nothing writes them yet.
+Manifests are versioned (format 2 since datasets; format 1 manifests of
+older memos still read).
+
 ## Using it
 
 ```cpp
@@ -282,6 +300,11 @@ kiln ref set head $id                   # prints the ref's version
 kiln ref set head $other_id VERSION     # only if head is still at VERSION
 kiln ref get head
 kiln ref ls
+kiln --write_through=localfs data put some/dir input  # a dataset of the directory's files
+kiln data ls                            # datasets: name, version, files, bytes
+kiln data ls input                      # its files: name, size, chunk
+kiln data get input/part-00000 copy     # one file; data get input DIR for all
+kiln data rm input                      # with its files
 scripts/stop_local_cluster.sh
 ```
 
@@ -340,7 +363,7 @@ VM:
   of regions in `kiln/server`.
 - `kiln/local`: a whole cluster in one process, for tests, examples and
   benchmarks.
-- `kiln/catalog`: the catalog's memos, on the public client API.
+- `kiln/catalog`: the catalog's memos and datasets, on the public client API.
 - `bin`: `kiln_meta`, `kiln_server` and the `kiln` command line client.
 - `examples`, `bench`.
 

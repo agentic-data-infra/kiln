@@ -35,6 +35,7 @@ cxx_binary(
     name = "kiln",
     srcs = ["Kiln.cpp"],
     deps = [
+        "//kiln/catalog:catalog",
         "//kiln/client:client",
         "//kiln/objectstore:objectstore",
     ],
