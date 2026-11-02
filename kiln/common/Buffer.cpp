@@ -2,6 +2,7 @@
 
 #include <new>
 #include <stdexcept>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -33,13 +34,17 @@ Buffer Buffer::wrap(void* data, size_t capacity) {
   return buffer;
 }
 
+Buffer::Buffer(Buffer&& other) noexcept {
+  *this = std::move(other);
+}
+
 Buffer& Buffer::operator=(Buffer&& other) noexcept {
   // The registration goes before the memory it covers.
   registration_ = std::move(other.registration_);
   owned_ = std::move(other.owned_);
-  data_ = other.data_;
-  size_ = other.size_;
-  capacity_ = other.capacity_;
+  data_ = std::exchange(other.data_, nullptr);
+  size_ = std::exchange(other.size_, 0);
+  capacity_ = std::exchange(other.capacity_, 0);
   return *this;
 }
 

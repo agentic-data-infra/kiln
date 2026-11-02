@@ -225,6 +225,11 @@ class ChunkWriter {
   // Appends data.bytes() and returns 'data' for reuse.
   folly::coro::Task<Buffer> co_append(Buffer&& data);
 
+  // Appends the bytes of all of 'data', in order, as one append: all of
+  // the blocks they fill are written at once, each straight from the
+  // buffers. Returns 'data' for reuse.
+  folly::coro::Task<std::vector<Buffer>> co_append(std::vector<Buffer>&& data);
+
   // Makes the chunk visible and returns its id.
   folly::coro::Task<ChunkId> co_commit();
 
@@ -247,8 +252,10 @@ class ChunkWriter {
 
   void checkOpen() const;
 
-  // Appends 'bytes' to a copy in a tier of blocks.
-  folly::coro::Task<void> co_appendTo(Replica& replica, folly::ByteRange bytes);
+  // Appends 'pieces', in order, to a copy in a tier of blocks.
+  folly::coro::Task<void> co_appendTo(
+      Replica& replica,
+      const std::vector<folly::ByteRange>& pieces);
 
   Client& client_;
   const BucketId bucket_;

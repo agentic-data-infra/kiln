@@ -15,9 +15,9 @@ cxx_library(
 
 cxx_library(
     name = "client",
-    srcs = ["Client.cpp"],
+    srcs = ["BufferPool.cpp", "Client.cpp"],
     header_namespace = "kiln/client",
-    exported_headers = ["Client.h"],
+    exported_headers = ["BufferPool.h", "Client.h"],
     exported_deps = ["//kiln/common:common"],
     deps = [
         ":transport",

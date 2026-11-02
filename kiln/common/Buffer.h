@@ -14,7 +14,7 @@ namespace kiln {
 // Client::allocateBuffer or wrap their own memory with
 // Client::registerMemory; with the RDMA transport both are registered with
 // the NIC, so that chunk data moves straight between them and the storage
-// servers. Move only.
+// servers. Move only; a moved-from buffer is empty.
 class Buffer {
  public:
   Buffer() = default;
@@ -26,7 +26,7 @@ class Buffer {
   // the buffer is in use.
   static Buffer wrap(void* data, size_t capacity);
 
-  Buffer(Buffer&&) noexcept = default;
+  Buffer(Buffer&& other) noexcept;
   Buffer& operator=(Buffer&& other) noexcept;
 
   // Keeps 'registration' (e.g. of the memory with the NIC) as long as the

@@ -4,7 +4,9 @@
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Collect.h>
+#include <folly/executors/InlineExecutor.h>
 
+#include "kiln/client/BufferPool.h"
 #include "kiln/client/Client.h"
 #include "kiln/common/Error.h"
 #include "kiln/local/LocalCluster.h"
@@ -332,6 +334,77 @@ TEST_P(ClientTest, refs) {
   try {
     blockingWait(client_->co_casRef("", std::nullopt, "x"));
     FAIL() << "Set a ref without a name";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kInvalidArgument);
+  }
+}
+
+// Several buffers as one append: the chunk is their bytes in order, the
+// same chunk as from one buffer, and later appends go on after them.
+TEST_P(ClientTest, gatherAppend) {
+  const auto data = bytes(3 * kBlockSize + 5000);
+  // Pieces that end inside blocks, an empty one, and one spanning blocks.
+  const std::vector<size_t> sizes = {1000, 0, kBlockSize + 300, 7, 2 * kBlockSize};
+  auto writer = blockingWait(client_->co_create(kDefaultBucket));
+  std::vector<Buffer> buffers;
+  size_t done = 0;
+  for (auto size : sizes) {
+    buffers.push_back(toBuffer(*client_, data.substr(done, size)));
+    done += size;
+  }
+  auto returned = blockingWait(writer->co_append(std::move(buffers)));
+  ASSERT_EQ(returned.size(), sizes.size());
+  EXPECT_EQ(returned[2].size(), kBlockSize + 300);
+  EXPECT_EQ(writer->size(), done);
+  blockingWait(writer->co_append(toBuffer(*client_, data.substr(done))));
+  const auto id = blockingWait(writer->co_commit());
+  EXPECT_EQ(id, ChunkId::of(folly::StringPiece(data)));
+  EXPECT_EQ(get(id), data);
+  EXPECT_EQ(get(id, kBlockSize - 10, 1000), data.substr(kBlockSize - 10, 1000));
+  blockingWait(client_->co_remove(id));
+}
+
+TEST_P(ClientTest, bufferPool) {
+  BufferPool pool(*client_, 1 << 20, 3);
+  EXPECT_EQ(pool.available(), 3);
+  auto two = blockingWait(pool.co_acquire(2));
+  ASSERT_EQ(two.size(), 2);
+  EXPECT_EQ(two[0].capacity(), 1 << 20);
+  EXPECT_EQ(two[0].size(), 0);
+  // Not enough free: none, rather than some.
+  EXPECT_TRUE(pool.tryAcquire(2).empty());
+
+  // Pool buffers move chunk data like any other.
+  std::memcpy(two[0].data(), "pooled", 6);
+  two[0].setSize(6);
+  auto writer = blockingWait(client_->co_create(kDefaultBucket));
+  two[0] = blockingWait(writer->co_append(std::move(two[0])));
+  const auto id = blockingWait(writer->co_commit());
+  EXPECT_EQ(get(id), "pooled");
+  blockingWait(client_->co_remove(id));
+
+  // A waiter for two, with one free: it waits (registered before start()
+  // returns, on the inline executor), and callers after it wait too.
+  auto waiting = folly::coro::co_withExecutor(
+                     &folly::InlineExecutor::instance(), pool.co_acquire(2))
+                     .start();
+  EXPECT_FALSE(waiting.isReady());
+  EXPECT_TRUE(pool.tryAcquire(1).empty());
+  // An empty buffer, its memory lost, comes back as a new one: two free now.
+  pool.release(Buffer{});
+  ASSERT_TRUE(waiting.isReady());
+  auto served = std::move(waiting).get();
+  ASSERT_EQ(served.size(), 2);
+  EXPECT_EQ(served[0].capacity(), 1 << 20);
+  EXPECT_EQ(served[1].capacity(), 1 << 20);
+  EXPECT_EQ(pool.available(), 0);
+  pool.release(std::move(two[0]));
+  pool.release(std::move(served));
+  EXPECT_EQ(pool.available(), 3);
+
+  try {
+    blockingWait(pool.co_acquire(4));
+    FAIL() << "Took more buffers than the pool has";
   } catch (const Error& e) {
     EXPECT_EQ(e.code(), ErrorCode::kInvalidArgument);
   }
