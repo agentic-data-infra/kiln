@@ -16,6 +16,14 @@ TEST(BufferTest, allocate) {
 
   auto moved = std::move(buffer);
   EXPECT_EQ(moved.size(), 10'000);
+  // The moved-from buffer is empty, so it cannot pass for the memory.
+  EXPECT_EQ(buffer.data(), nullptr);
+  EXPECT_EQ(buffer.capacity(), 0);
+  EXPECT_EQ(buffer.size(), 0);
+  Buffer assigned;
+  assigned = std::move(moved);
+  EXPECT_EQ(assigned.capacity(), 10'000);
+  EXPECT_EQ(moved.capacity(), 0);
 }
 
 TEST(BufferTest, wrap) {

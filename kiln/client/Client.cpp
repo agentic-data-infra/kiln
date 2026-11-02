@@ -411,27 +411,48 @@ void ChunkWriter::checkOpen() const {
 }
 
 folly::coro::Task<Buffer> ChunkWriter::co_append(Buffer&& data) {
+  std::vector<Buffer> buffers;
+  buffers.push_back(std::move(data));
+  auto appended = co_await co_append(std::move(buffers));
+  co_return std::move(appended[0]);
+}
+
+folly::coro::Task<std::vector<Buffer>> ChunkWriter::co_append(
+    std::vector<Buffer>&& data) {
   checkOpen();
-  auto bytes = data.bytes();
-  if (bytes.empty()) {
+  std::vector<folly::ByteRange> pieces;
+  uint64_t size = 0;
+  for (const auto& buffer : data) {
+    if (buffer.size() > 0) {
+      pieces.push_back(buffer.bytes());
+      size += buffer.size();
+    }
+  }
+  if (size == 0) {
     co_return std::move(data);
   }
   // A failed append leaves the chunk incomplete; only co_abort is left.
   closed_ = true;
   std::vector<folly::coro::Task<void>> appends;
   for (auto& replica : replicas_) {
-    appends.push_back(co_appendTo(replica, bytes));
+    appends.push_back(co_appendTo(replica, pieces));
   }
   co_await folly::coro::collectAllRange(std::move(appends));
-  hasher_->update(bytes);
-  size_ += bytes.size();
+  for (const auto& piece : pieces) {
+    hasher_->update(piece);
+  }
+  size_ += size;
   closed_ = false;
   co_return std::move(data);
 }
 
 folly::coro::Task<void> ChunkWriter::co_appendTo(
     Replica& replica,
-    folly::ByteRange bytes) {
+    const std::vector<folly::ByteRange>& pieces) {
+  uint64_t size = 0;
+  for (const auto& piece : pieces) {
+    size += piece.size();
+  }
   auto& blocks = replica.blocks;
   // Fill the first block with room, then the next ones: the size hint may
   // have allocated some ahead. Then new ones.
@@ -443,8 +464,8 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
   for (size_t i = first; i < blocks.size(); ++i) {
     room += kBlockSize - blocks[i].length;
   }
-  if (bytes.size() > room) {
-    auto count = (bytes.size() - room + kBlockSize - 1) / kBlockSize;
+  if (size > room) {
+    auto count = (size - room + kBlockSize - 1) / kBlockSize;
     std::optional<Tier> overflow;
     if (blocks.empty()) {
       count = std::max(count, (sizeHint_ + kBlockSize - 1) / kBlockSize);
@@ -460,7 +481,7 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
   // The blocks this append writes to; the size hint may have allocated
   // more.
   size_t last = first;
-  for (uint64_t covered = 0; covered < bytes.size(); ++last) {
+  for (uint64_t covered = 0; covered < size; ++last) {
     covered += kBlockSize - blocks[last].length;
   }
   std::vector<BlockRef> touched(blocks.begin() + first, blocks.begin() + last);
@@ -472,17 +493,27 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
     placement_.overflow.reset();
   }
 
+  // One write per block and piece it spans: each from one piece's memory.
   std::vector<folly::coro::Task<void>> writes;
-  size_t done = 0;
-  for (size_t i = first; done < bytes.size(); ++i) {
+  size_t piece = 0;
+  size_t pieceDone = 0;
+  for (size_t i = first; piece < pieces.size(); ++i) {
     auto& block = blocks[i];
-    const auto n =
-        std::min<uint64_t>(kBlockSize - block.length, bytes.size() - done);
     const auto& region = regions[i - first];
-    writes.push_back(client_.transportFor(region).co_write(
-        region, block.offset + block.length, bytes.subpiece(done, n)));
-    block.length += n;
-    done += n;
+    while (block.length < kBlockSize && piece < pieces.size()) {
+      const auto n = std::min<uint64_t>(
+          kBlockSize - block.length, pieces[piece].size() - pieceDone);
+      writes.push_back(client_.transportFor(region).co_write(
+          region,
+          block.offset + block.length,
+          pieces[piece].subpiece(pieceDone, n)));
+      block.length += n;
+      pieceDone += n;
+      if (pieceDone == pieces[piece].size()) {
+        ++piece;
+        pieceDone = 0;
+      }
+    }
   }
   co_await folly::coro::collectAllRange(std::move(writes));
 }

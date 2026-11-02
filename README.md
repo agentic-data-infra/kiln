@@ -132,13 +132,21 @@ and how many bytes went over RDMA, straight from registered buffers
 
 For zero copy, the buffer must be registered with the NIC too: buffers from
 `Client::allocateBuffer` and `Client::registerMemory` are, until they go.
-Registering takes time, so keep a pool of buffers and reuse them. Other
-memory works, but goes through a copy, with a warning.
+Registering takes time, so keep buffers and reuse them: a
+`kiln::client::BufferPool` allocates a fixed number of equal buffers up
+front, hands out several at once, and makes callers wait while none are
+free. `ChunkWriter::co_append` also takes a list of buffers, appended in
+order as one append, each written straight from its buffer. Other memory
+works, but goes through a copy, with a warning.
 
 ```cpp
 kiln::client::Client client({.metadata = kiln::MetadataAddress::parse(urls)});
 auto buffer = client.allocateBuffer(64 << 20);    // registered once
 buffer = co_await client.co_read(id, 0, 64 << 20, std::move(buffer));
+
+kiln::client::BufferPool pool(client, 4 << 20, 64);  // 64 x 4 MiB, registered now
+auto buffers = co_await pool.co_acquire(16);         // fill them, then
+pool.release(co_await writer->co_append(std::move(buffers)));
 ```
 
 ### A cluster on one machine

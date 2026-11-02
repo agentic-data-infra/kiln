@@ -11,6 +11,7 @@
 #include <folly/coro/BlockingWait.h>
 #include <gtest/gtest.h>
 
+#include "kiln/client/BufferPool.h"
 #include "kiln/client/Client.h"
 #include "kiln/client/RdmaTransport.h"
 #include "kiln/common/Error.h"
@@ -164,6 +165,35 @@ TEST_F(RdmaTest, writesAndReadsRegisteredBuffersWithoutCopies) {
   const auto stats = client_->stats();
   EXPECT_EQ(stats.rdmaBytes, 2 * data.size() + memory.size());
   EXPECT_EQ(stats.rdmaCopiedBytes, 0);
+}
+
+// A gather append from pool buffers: each piece moves straight from its
+// buffer, also where a block spans two of them.
+TEST_F(RdmaTest, gatherAppendsPoolBuffersWithoutCopies) {
+  BufferPool pool(*client_, 1 << 20, 4);
+  const auto data = pattern((3 << 20) + 777);
+  auto buffers = blockingWait(pool.co_acquire(4));
+  // Pieces of 1 MiB - 100 bytes, so that blocks span two buffers.
+  size_t done = 0;
+  for (auto& buffer : buffers) {
+    const auto n = std::min<size_t>((1 << 20) - 100, data.size() - done);
+    std::memcpy(buffer.data(), data.data() + done, n);
+    buffer.setSize(n);
+    done += n;
+  }
+  ASSERT_EQ(done, data.size());
+  auto writer = blockingWait(client_->co_create(kDefaultBucket));
+  pool.release(blockingWait(writer->co_append(std::move(buffers))));
+  const auto id = blockingWait(writer->co_commit());
+
+  auto read = blockingWait(client_->co_read(
+      id, 0, data.size(), client_->allocateBuffer(data.size())));
+  ASSERT_EQ(read.size(), data.size());
+  EXPECT_EQ(std::memcmp(read.data(), data.data(), data.size()), 0);
+  const auto stats = client_->stats();
+  EXPECT_EQ(stats.rdmaBytes, 2 * data.size());
+  EXPECT_EQ(stats.rdmaCopiedBytes, 0);
+  EXPECT_EQ(pool.available(), 4);
 }
 
 // Memory that is not registered works too, through a copy.
