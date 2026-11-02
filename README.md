@@ -137,7 +137,9 @@ Registering takes time, so keep buffers and reuse them: a
 front, hands out several at once, and makes callers wait while none are
 free. `ChunkWriter::co_append` also takes a list of buffers, appended in
 order as one append, each written straight from its buffer. Other memory
-works, but goes through a copy, with a warning.
+works, but goes through a copy, with a warning. The catalog reads and
+writes manifests through a pool too, given one
+(`CatalogOptions::buffers`); otherwise it allocates a buffer per call.
 
 ```cpp
 kiln::client::Client client({.metadata = kiln::MetadataAddress::parse(urls)});

@@ -3,7 +3,9 @@
 #include <cstring>
 
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 
+#include "kiln/client/BufferPool.h"
 #include "kiln/client/Client.h"
 #include "kiln/common/Error.h"
 
@@ -185,10 +187,7 @@ folly::coro::Task<std::optional<Manifest>> Catalog::co_getMemo(
   std::optional<Manifest> manifest;
   try {
     const auto id = ChunkId::parse(ref->value);
-    const auto size = (co_await client_.co_stat(id)).size;
-    auto data = co_await client_.co_read(
-        id, 0, size, client_.allocateBuffer(std::max<uint64_t>(size, 1)));
-    auto [storedKey, stored] = decodeManifest(data.bytes());
+    auto [storedKey, stored] = co_await co_readManifest(id);
     // Another key with the same hash: not this key's memo.
     if (storedKey != key) {
       co_return std::nullopt;
@@ -233,10 +232,65 @@ folly::coro::Task<ChunkId> Catalog::co_writeManifest(
     Manifest manifest) {
   auto data = encodeManifest(key, manifest);
   auto writer = co_await client_.co_create(kDefaultBucket, options_.placement);
-  auto buffer = client_.registerMemory(data.data(), data.size());
-  buffer.setSize(data.size());
-  co_await writer->co_append(std::move(buffer));
+  const auto& pool = options_.buffers;
+  const auto n = pool == nullptr
+      ? 0
+      : (data.size() + pool->bufferSize() - 1) / pool->bufferSize();
+  if (n == 0 || n > pool->count()) {
+    auto buffer = client_.registerMemory(data.data(), data.size());
+    buffer.setSize(data.size());
+    co_await writer->co_append(std::move(buffer));
+  } else {
+    auto buffers = co_await pool->co_acquire(n);
+    SCOPE_EXIT {
+      pool->release(std::move(buffers));
+    };
+    for (size_t i = 0; i < n; ++i) {
+      const auto offset = i * pool->bufferSize();
+      const auto length = std::min(data.size() - offset, pool->bufferSize());
+      std::memcpy(buffers[i].data(), data.data() + offset, length);
+      buffers[i].setSize(length);
+    }
+    buffers = co_await writer->co_append(std::move(buffers));
+  }
   co_return co_await writer->co_commit();
+}
+
+folly::coro::Task<std::pair<std::string, Manifest>> Catalog::co_readManifest(
+    ChunkId id) {
+  const auto size = (co_await client_.co_stat(id)).size;
+  const auto& pool = options_.buffers;
+  if (pool == nullptr) {
+    auto data = co_await client_.co_read(
+        id, 0, size, client_.allocateBuffer(std::max<uint64_t>(size, 1)));
+    co_return decodeManifest(data.bytes());
+  }
+  auto buffers = co_await pool->co_acquire(1);
+  SCOPE_EXIT {
+    pool->release(std::move(buffers));
+  };
+  if (size <= pool->bufferSize()) {
+    buffers[0] = co_await client_.co_read(id, 0, size, std::move(buffers[0]));
+    co_return decodeManifest(buffers[0].bytes());
+  }
+  // Larger than a buffer: in pieces, copied together.
+  std::string data;
+  data.reserve(size);
+  for (uint64_t done = 0; done < size;) {
+    const auto length = std::min<uint64_t>(size - done, pool->bufferSize());
+    buffers[0] =
+        co_await client_.co_read(id, done, length, std::move(buffers[0]));
+    if (buffers[0].size() != length) {
+      throw Error(
+          ErrorCode::kInvalidArgument,
+          fmt::format("Manifest {} is cut short", id.toString()));
+    }
+    data.append(
+        reinterpret_cast<const char*>(buffers[0].data()), buffers[0].size());
+    done += length;
+  }
+  co_return decodeManifest(folly::ByteRange(
+      reinterpret_cast<const uint8_t*>(data.data()), data.size()));
 }
 
 folly::coro::Task<bool> Catalog::co_putMemo(
@@ -273,10 +327,7 @@ folly::coro::Task<std::optional<Dataset>> Catalog::co_getDataset(
     co_return std::nullopt;
   }
   const auto id = ChunkId::parse(ref->value);
-  const auto size = (co_await client_.co_stat(id)).size;
-  auto data = co_await client_.co_read(
-      id, 0, size, client_.allocateBuffer(std::max<uint64_t>(size, 1)));
-  auto [storedName, manifest] = decodeManifest(data.bytes());
+  auto [storedName, manifest] = co_await co_readManifest(id);
   if (storedName != name) {
     throw Error(
         ErrorCode::kInvalidArgument,

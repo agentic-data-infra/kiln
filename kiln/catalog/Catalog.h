@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@
 #include "kiln/common/Types.h"
 
 namespace kiln::client {
+class BufferPool;
 class Client;
 }
 
@@ -74,6 +76,11 @@ struct CatalogOptions {
   // Where manifests go. Written through to the local FS by default, so with
   // a journal they outlive restarts.
   Placement placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs};
+  // Buffers manifests are read and written through, taken for one read or
+  // append each, so that the catalog neither allocates nor (with RDMA)
+  // registers memory per call. Without, each call allocates a buffer for
+  // the manifest it reads and registers the one it writes.
+  std::shared_ptr<client::BufferPool> buffers;
   // The names of memo refs start with this.
   std::string refPrefix{"memo/"};
   // The names of dataset refs start with this.
@@ -143,6 +150,9 @@ class Catalog {
   folly::coro::Task<ChunkId> co_writeManifest(
       std::string key,
       Manifest manifest);
+
+  // Reads and decodes the manifest in chunk 'id'.
+  folly::coro::Task<std::pair<std::string, Manifest>> co_readManifest(ChunkId id);
 
   client::Client& client_;
   const CatalogOptions options_;

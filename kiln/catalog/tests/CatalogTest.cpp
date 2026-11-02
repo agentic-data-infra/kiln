@@ -3,6 +3,7 @@
 #include <folly/coro/BlockingWait.h>
 
 #include "kiln/catalog/Catalog.h"
+#include "kiln/client/BufferPool.h"
 #include "kiln/client/Client.h"
 #include "kiln/common/Error.h"
 #include "kiln/local/LocalCluster.h"
@@ -235,6 +236,31 @@ TEST_F(CatalogTest, publishGetDelete) {
   // The files went with the dataset's bucket, the manifest with it.
   EXPECT_THROW(blockingWait(client_.co_stat(file.id)), Error);
   EXPECT_THROW(blockingWait(client_.co_stat(dataset->manifestId)), Error);
+}
+
+TEST_F(CatalogTest, manifestsThroughPooledBuffers) {
+  // Buffers of 64 bytes, so that the manifests take several: written as
+  // one gather append, read back piece by piece. The pool keeps them all.
+  auto pool = std::make_shared<client::BufferPool>(client_, 64, 8);
+  Catalog catalog{client_, CatalogOptions{.buffers = pool}};
+  const auto manifest = filesOf({{"part-00000", "abc"}, {"part-00001", "de"}});
+  ASSERT_TRUE(blockingWait(catalog.co_publishDataset("pooled", manifest)));
+  EXPECT_EQ(blockingWait(catalog.co_getDataset("pooled"))->manifest, manifest);
+  EXPECT_EQ(blockingWait(catalog_.co_getDataset("pooled"))->manifest, manifest);
+  const auto memo = manifestOf({ChunkRange{.id = put("memo")}});
+  ASSERT_TRUE(blockingWait(catalog.co_putMemo("q", memo)));
+  EXPECT_EQ(blockingWait(catalog.co_getMemo("q")), memo);
+  EXPECT_EQ(pool->available(), 8);
+
+  // A manifest larger than the whole pool is registered as it is.
+  std::vector<std::pair<std::string, std::string>> files;
+  for (int i = 0; i < 20; ++i) {
+    files.emplace_back(fmt::format("part-{:05}", i), "x");
+  }
+  const auto large = filesOf(files);
+  ASSERT_TRUE(blockingWait(catalog.co_publishDataset("large", large)));
+  EXPECT_EQ(blockingWait(catalog.co_getDataset("large"))->manifest, large);
+  EXPECT_EQ(pool->available(), 8);
 }
 
 TEST_F(CatalogTest, newVersions) {
