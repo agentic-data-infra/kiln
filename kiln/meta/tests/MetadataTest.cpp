@@ -28,22 +28,42 @@ std::vector<RegionInfo> registerServer(
       metadata.co_registerServer(std::move(regions), budgetBlocks * kBlockSize));
 }
 
-// Commits a chunk of 'blocks' full blocks in 'tier'.
+// Commits a chunk of 'blocks' full blocks in 'tier', ephemeral unless
+// asked: most tests are about eviction.
 ChunkId commit(
     Metadata& metadata,
     uint64_t id,
     uint32_t blocks,
     Tier tier = Tier::kDram,
-    BucketId bucket = kDefaultBucket) {
+    BucketId bucket = kDefaultBucket,
+    Retention retention = Retention::kEphemeral) {
   ChunkInfo chunk{
       .id = ChunkId{id, id},
       .bucket = bucket,
       .size = blocks * kBlockSize,
-      .placement = Placement{.tier = tier},
+      .placement = Placement{.tier = tier, .retention = retention},
       .replicas = {Replica{
           .tier = tier,
           .blocks = blockingWait(metadata.co_allocate(tier, blocks))}}};
   return blockingWait(metadata.co_commit(std::move(chunk))).id;
+}
+
+ChunkId commitRetained(
+    Metadata& metadata,
+    uint64_t id,
+    uint32_t blocks,
+    Tier tier = Tier::kDram) {
+  return commit(
+      metadata, id, blocks, tier, kDefaultBucket, Retention::kRetained);
+}
+
+// The tiers of the chunk's copies.
+std::vector<Tier> tiersOf(Metadata& metadata, ChunkId id) {
+  std::vector<Tier> tiers;
+  for (const auto& replica : blockingWait(metadata.co_lookup(id)).replicas) {
+    tiers.push_back(replica.tier);
+  }
+  return tiers;
 }
 
 bool exists(Metadata& metadata, ChunkId id) {
@@ -355,7 +375,9 @@ TEST(MetadataTest, writeThroughCopies) {
               .blocks = blockingWait(metadata.co_allocate(Tier::kLocalFs, 2))}}};
   EXPECT_EQ(blockingWait(metadata.co_commit(chunk)), chunk);
 
-  // Evicting the DRAM copy leaves the local-FS one.
+  // Evicting the DRAM copy leaves the local-FS one, also of a retained
+  // chunk.
+  EXPECT_EQ(chunk.placement.retention, Retention::kRetained);
   commit(metadata, 2, 4);
   auto left = blockingWait(metadata.co_lookup(chunk.id));
   ASSERT_EQ(left.replicas.size(), 1);
@@ -461,6 +483,129 @@ TEST(MetadataTest, journalKeepsWrittenThroughCopies) {
   for (const auto& block : blockingWait(metadata.co_allocate(Tier::kLocalFs, 3))) {
     EXPECT_NE(block, durable.replicas[1].blocks[0]);
   }
+}
+
+TEST(MetadataTest, retainedChunksAreNotEvicted) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {4});
+  const auto kept = commitRetained(metadata, 1, 2);
+  const auto cached = commit(metadata, 2, 2);
+  // The ephemeral chunk makes room; the retained one stays.
+  commit(metadata, 3, 2);
+  EXPECT_EQ(metadata.evictions(), 1);
+  EXPECT_FALSE(exists(metadata, cached));
+  EXPECT_TRUE(exists(metadata, kept));
+
+  // A tier full of retained chunks has no room.
+  blockingWait(metadata.co_remove(ChunkId{3, 3}));
+  commitRetained(metadata, 4, 2);
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_allocate(Tier::kDram, 1);
+      }()),
+      ErrorCode::kOutOfSpace);
+  EXPECT_TRUE(exists(metadata, kept));
+  EXPECT_EQ(metadata.evictions(), 1);
+}
+
+TEST(MetadataTest, retainedCopiesGoOnInTheOverflowTier) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {4});
+  registerServer(metadata, "b:1", Tier::kLocalFs, {4});
+  auto copy = [&](std::vector<Tier> tiers) {
+    Replica replica{.tier = tiers[0]};
+    for (auto tier : tiers) {
+      auto blocks = blockingWait(metadata.co_allocate(tier, 1));
+      replica.blocks.push_back(blocks[0]);
+    }
+    return replica;
+  };
+  auto chunk = [&](uint64_t id, Replica replica, Placement placement) {
+    return ChunkInfo{
+        .id = ChunkId{id, id},
+        .size = replica.blocks.size() * kBlockSize,
+        .placement = placement,
+        .replicas = {std::move(replica)}};
+  };
+  const Placement retained{.tier = Tier::kDram};
+  const Placement ephemeral{
+      .tier = Tier::kDram, .retention = Retention::kEphemeral};
+
+  // A retained chunk's copy may start in DRAM and go on in local FS.
+  const auto mixed =
+      chunk(1, copy({Tier::kDram, Tier::kLocalFs, Tier::kLocalFs}), retained);
+  EXPECT_EQ(blockingWait(metadata.co_commit(mixed)), mixed);
+  EXPECT_EQ(blockingWait(metadata.co_lookup(mixed.id)).replicas, mixed.replicas);
+
+  // Not an ephemeral one, nor back and forth.
+  for (const auto& bad :
+       {chunk(2, copy({Tier::kDram, Tier::kLocalFs}), ephemeral),
+        chunk(3, copy({Tier::kDram, Tier::kLocalFs, Tier::kDram}), retained)}) {
+    EXPECT_EQ(
+        errorOf([&]() -> folly::coro::Task<void> {
+          co_await metadata.co_commit(bad);
+        }()),
+        ErrorCode::kInvalidArgument);
+  }
+
+  // Removing it frees its blocks in both tiers (the rejected chunks' blocks
+  // stay allocated).
+  EXPECT_TRUE(blockingWait(metadata.co_remove(mixed.id)));
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 1);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 2);
+}
+
+TEST(MetadataTest, journalKeepsRetention) {
+  folly::test::TemporaryDirectory dir;
+  MetadataOptions options = exact();
+  options.journal = dir.path().string() + "/journal";
+  std::vector<RegionInfo> regions;
+  auto writeThrough = [&](Metadata& metadata, uint64_t id, Retention retention) {
+    ChunkInfo chunk{
+        .id = ChunkId{id, id},
+        .size = kBlockSize,
+        .placement =
+            {.tier = Tier::kDram,
+             .writeThrough = Tier::kLocalFs,
+             .retention = retention},
+        .replicas = {
+            Replica{
+                .tier = Tier::kDram,
+                .blocks = blockingWait(metadata.co_allocate(Tier::kDram, 1))},
+            Replica{
+                .tier = Tier::kLocalFs,
+                .blocks =
+                    blockingWait(metadata.co_allocate(Tier::kLocalFs, 1))}}};
+    return blockingWait(metadata.co_commit(std::move(chunk))).id;
+  };
+  ChunkId kept;
+  ChunkId cached;
+  {
+    Metadata metadata(options);
+    registerServer(metadata, "a:1", Tier::kDram, {4});
+    regions = registerServer(metadata, "b:1", Tier::kLocalFs, {4});
+    kept = writeThrough(metadata, 1, Retention::kRetained);
+    cached = writeThrough(metadata, 2, Retention::kEphemeral);
+  }
+
+  Metadata metadata(options);
+  blockingWait(metadata.co_registerServer(regions, 0));
+  EXPECT_EQ(
+      blockingWait(metadata.co_lookup(kept)).placement.retention,
+      Retention::kRetained);
+  EXPECT_EQ(
+      blockingWait(metadata.co_lookup(cached)).placement.retention,
+      Retention::kEphemeral);
+  // Filling the local FS evicts the ephemeral chunk's only copy, not the
+  // retained one's.
+  blockingWait(metadata.co_allocate(Tier::kLocalFs, 3));
+  EXPECT_FALSE(exists(metadata, cached));
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_allocate(Tier::kLocalFs, 1);
+      }()),
+      ErrorCode::kOutOfSpace);
+  EXPECT_EQ(tiersOf(metadata, kept), std::vector{Tier::kLocalFs});
 }
 
 TEST(MetadataTest, bucketsRemoveTheirChunks) {

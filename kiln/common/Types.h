@@ -152,25 +152,42 @@ struct BlockRef {
   bool operator==(const BlockRef&) const = default;
 };
 
+// Whether eviction may drop a chunk's last copy.
+enum class Retention {
+  // Never: a tier full of retained chunks takes no more of them, and an
+  // allocation for one fails with kOutOfSpace unless it can overflow.
+  // Copies the chunk also has elsewhere are evicted as usual.
+  kRetained,
+  // When its tier fills, like a cached result that can be computed again:
+  // the chunk is gone once it has no copies left.
+  kEphemeral,
+};
+
 // Where a new chunk goes: into 'tier' (DRAM or local FS), and, if set, also
 // into 'writeThrough', a durable tier (isDurable), before its commit returns. The metadata server
 // journals a written-through chunk's copy in its target tier, so with a
 // local FS or object store target, the chunk outlives restarts.
 //
-// With 'overflow' set (a tier of blocks, without 'writeThrough'), the chunk
-// goes into 'tier' if its first allocation fits into the free blocks there
-// without evicting anything, else into 'overflow' as a whole, which evicts
-// as usual. The committed chunk's placement names the tier it went to.
+// With 'overflow' set (a tier of blocks, without 'writeThrough'), the
+// blocks of an allocation go into 'tier' if they fit into the free blocks
+// there without evicting anything, else into 'overflow', which evicts as
+// usual. For an ephemeral chunk the first allocation decides for all of it,
+// so the chunk is in one tier. A retained chunk decides at every
+// allocation: it may start in 'tier' and go on in 'overflow'. The committed
+// chunk's placement names the tier it starts in.
 struct Placement {
   Tier tier{Tier::kDram};
   std::optional<Tier> writeThrough;
   std::optional<Tier> overflow;
+  Retention retention{Retention::kRetained};
 
   bool operator==(const Placement&) const = default;
 };
 
 // A copy of a chunk in one tier: its bytes are the blocks' bytes in order,
-// or, in the object store, the object at chunkObjectKey(id).
+// or, in the object store, the object at chunkObjectKey(id). The copy of a
+// retained chunk that overflowed (Placement) starts with blocks in its tier
+// and goes on with blocks in its overflow tier.
 struct Replica {
   Tier tier{Tier::kDram};
   std::vector<BlockRef> blocks;
@@ -179,7 +196,8 @@ struct Replica {
 };
 
 // A committed chunk and its copies, fastest tier first. Eviction drops a
-// copy in one tier; the chunk is gone when it has none left.
+// copy in one tier, but never the last one of a retained chunk; the chunk is
+// gone when it has none left.
 struct ChunkInfo {
   ChunkId id;
   // Hashed into the id with the bytes (except the default bucket), so equal

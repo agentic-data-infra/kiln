@@ -103,7 +103,8 @@ class Client {
   // Starts a new chunk in 'bucket' (see co_createBucket), in the
   // placement's tier, and its write-through tier if set. With 'sizeHint', the chunk's expected size, the first
   // append allocates blocks for that many bytes at once, so that a
-  // placement with an overflow tier puts the whole chunk into one tier.
+  // placement with an overflow tier puts the whole chunk into one tier
+  // (a retained chunk goes on in the overflow tier if it grows beyond).
   // Blocks beyond the committed size are freed.
   folly::coro::Task<std::unique_ptr<ChunkWriter>> co_create(
       BucketId bucket,
@@ -259,8 +260,10 @@ class ChunkWriter {
 
   Client& client_;
   const BucketId bucket_;
-  // The overflow tier is resolved by the first allocation.
+  // The tier is resolved by the first allocation.
   Placement placement_;
+  // Where a retained chunk goes on once its tier was full.
+  std::optional<Tier> tail_;
   const uint64_t sizeHint_;
   std::unique_ptr<ChunkHasher> hasher_;
   // The copies in tiers of blocks, by tier.

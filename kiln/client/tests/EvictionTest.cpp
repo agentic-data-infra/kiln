@@ -1,5 +1,6 @@
 // Eviction as clients see it: writing more than a tier's budget evicts its
-// least recently used chunks, which then read as not found.
+// least recently used ephemeral chunks, which then read as not found, and
+// moves retained ones from DRAM to local FS.
 
 #include <gtest/gtest.h>
 
@@ -33,7 +34,8 @@ class EvictionTest : public testing::Test {
             .chunkCacheTtl = 50ms}} {}
 
   ChunkId put(char fill, size_t size) {
-    auto writer = blockingWait(client_.co_create(kDefaultBucket));
+    auto writer = blockingWait(client_.co_create(
+        kDefaultBucket, Placement{.retention = Retention::kEphemeral}));
     auto buffer = client_.allocateBuffer(size);
     std::memset(buffer.data(), fill, size);
     buffer.setSize(size);
@@ -149,6 +151,148 @@ TEST(OverflowTest, wholeChunksOverflowWithoutEvicting) {
                     .overflow = Tier::kLocalFs})),
       Error);
 }
+
+// One DRAM and one local-FS server that may hold 8 MiB each; over shared
+// memory or TCP.
+class RetentionTest : public testing::TestWithParam<bool> {
+ protected:
+  RetentionTest()
+      : cluster_{local::LocalClusterOptions{
+            .dramServers = 1,
+            .localFsServers = 1,
+            .regionSize = 16 << 20,
+            .budget = 8 << 20,
+            .metadata = meta::MetadataOptions{
+                .gracePeriod = 100ms, .evictBelow = 0, .evictUntil = 0}}},
+        client_{ClientOptions{
+            .metadata = cluster_.metadataEndpoint(),
+            .useShm = GetParam(),
+            .chunkCacheTtl = 50ms}} {}
+
+  // Writes 'data' in appends of 1 MiB.
+  ChunkId put(const std::string& data, Placement placement = {}) {
+    auto writer = blockingWait(client_.co_create(kDefaultBucket, placement));
+    auto buffer = client_.allocateBuffer(1 << 20);
+    for (size_t done = 0; done < data.size(); done += 1 << 20) {
+      const auto n = std::min<size_t>(1 << 20, data.size() - done);
+      std::memcpy(buffer.data(), data.data() + done, n);
+      buffer.setSize(n);
+      buffer = blockingWait(writer->co_append(std::move(buffer)));
+    }
+    return blockingWait(writer->co_commit());
+  }
+
+  std::string get(ChunkId id) {
+    const auto size = blockingWait(client_.co_stat(id)).size;
+    auto buffer = blockingWait(
+        client_.co_read(id, 0, size, client_.allocateBuffer(size)));
+    return std::string(
+        reinterpret_cast<const char*>(buffer.data()), buffer.size());
+  }
+
+  // The tier of each block of the chunk's copies, in order.
+  std::vector<Tier> blockTiers(ChunkId id) {
+    std::vector<Tier> tiers;
+    for (const auto& replica : blockingWait(client_.co_stat(id)).replicas) {
+      for (const auto& block : replica.blocks) {
+        auto regions =
+            blockingWait(cluster_.metadata().co_getRegions({block.region}));
+        tiers.push_back(regions[0].tier);
+      }
+    }
+    return tiers;
+  }
+
+  // Distinct bytes, so that misplaced blocks show.
+  static std::string bytes(size_t size, char seed) {
+    std::string data(size, '\0');
+    for (size_t i = 0; i < size; ++i) {
+      data[i] = static_cast<char>(seed + i * 7 + i / 4093);
+    }
+    return data;
+  }
+
+  local::LocalCluster cluster_;
+  Client client_;
+};
+
+TEST_P(RetentionTest, retainedChunksOverflowPerAllocation) {
+  const Placement placement{.tier = Tier::kDram, .overflow = Tier::kLocalFs};
+  const auto a = bytes(3 << 20, 'a');
+  const auto b = bytes(8 << 20, 'b');
+  const auto idA = put(a, placement);
+  // B fills the rest of DRAM and goes on in the local FS.
+  const auto idB = put(b, placement);
+  EXPECT_EQ(cluster_.metadata().evictions(), 0);
+  EXPECT_EQ(blockTiers(idA), std::vector<Tier>(3, Tier::kDram));
+  std::vector<Tier> tiers(5, Tier::kDram);
+  tiers.resize(8, Tier::kLocalFs);
+  EXPECT_EQ(blockTiers(idB), tiers);
+  const auto info = blockingWait(client_.co_stat(idB));
+  EXPECT_EQ(info.placement.tier, Tier::kDram);
+  EXPECT_EQ(info.replicas[0].tier, Tier::kDram);
+  EXPECT_TRUE(get(idA) == a);
+  EXPECT_TRUE(get(idB) == b);
+
+  // Once DRAM is full, new retained chunks start in the local FS.
+  const auto c = bytes(2 << 20, 'c');
+  const auto idC = put(c, placement);
+  EXPECT_EQ(blockTiers(idC), std::vector<Tier>(2, Tier::kLocalFs));
+  EXPECT_TRUE(get(idC) == c);
+  EXPECT_EQ(cluster_.metadata().evictions(), 0);
+}
+
+TEST_P(RetentionTest, ephemeralChunksOverflowWhole) {
+  const Placement placement{
+      .tier = Tier::kDram,
+      .overflow = Tier::kLocalFs,
+      .retention = Retention::kEphemeral};
+  put(bytes(3 << 20, 'a'), placement);
+  // B starts in DRAM and stays there, evicting A rather than overflowing.
+  const auto b = bytes(8 << 20, 'b');
+  const auto idB = put(b, placement);
+  EXPECT_EQ(blockTiers(idB), std::vector<Tier>(8, Tier::kDram));
+  EXPECT_EQ(cluster_.metadata().evictions(), 1);
+  EXPECT_TRUE(get(idB) == b);
+}
+
+TEST_P(RetentionTest, retainedChunksWithoutOverflowRunOutOfSpace) {
+  const auto a = bytes(3 << 20, 'a');
+  const auto b = bytes(3 << 20, 'b');
+  const auto idA = put(a);
+  const auto idB = put(b);
+  try {
+    put(bytes(3 << 20, 'c'));
+    FAIL() << "Evicted a retained chunk";
+  } catch (const Error& e) {
+    EXPECT_EQ(e.code(), ErrorCode::kOutOfSpace);
+  }
+  EXPECT_EQ(cluster_.metadata().evictions(), 0);
+  std::this_thread::sleep_for(100ms); // Past the client's cache TTL.
+  EXPECT_TRUE(get(idA) == a);
+  EXPECT_TRUE(get(idB) == b);
+}
+
+TEST_P(RetentionTest, writtenThroughChunksLoseTheirDramCopy) {
+  const auto a = bytes(3 << 20, 'a');
+  const auto idA = put(
+      a, Placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs});
+  put(bytes(3 << 20, 'b'));
+  put(bytes(3 << 20, 'c'));
+  // A has a copy in local FS too: its DRAM copy is evicted.
+  EXPECT_EQ(cluster_.metadata().evictions(), 1);
+  std::this_thread::sleep_for(100ms);
+  EXPECT_EQ(blockTiers(idA), std::vector<Tier>(3, Tier::kLocalFs));
+  EXPECT_TRUE(get(idA) == a);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Transports,
+    RetentionTest,
+    testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+      return info.param ? "shm" : "tcp";
+    });
 
 } // namespace
 } // namespace kiln::client

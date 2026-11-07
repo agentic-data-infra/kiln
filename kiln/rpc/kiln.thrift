@@ -78,9 +78,15 @@ struct ChunkId {
   2: i64 low;
 }
 
+enum Retention {
+  RETAINED = 0,
+  EPHEMERAL = 1,
+}
+
 struct Placement {
   1: Tier tier;
   2: optional Tier writeThrough;
+  3: Retention retention;
 }
 
 struct Replica {
