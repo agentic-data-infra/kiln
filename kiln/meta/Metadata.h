@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -94,6 +95,8 @@ class Metadata : public rpc::MetadataRpc {
       BucketId bucket,
       std::chrono::milliseconds grace = {}) override;
 
+  folly::coro::Task<bool> co_releaseBucket(BucketId bucket) override;
+
   folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override;
 
   folly::coro::Task<std::optional<Ref>> co_casRef(
@@ -144,9 +147,10 @@ class Metadata : public rpc::MetadataRpc {
 
   struct Chunk {
     ChunkInfo info;
-    // The chunk's place in the LRU list of each tier of blocks it has a
-    // copy in.
-    LruList::iterator lru[kBlockTiers];
+    // The chunk's place in the LRU list of each tier of blocks it has
+    // blocks in. A copy that goes on in its overflow tier is in both lists,
+    // and is the chunk's only copy.
+    std::optional<LruList::iterator> lru[kBlockTiers];
   };
 
   using ChunkMap = std::unordered_map<ChunkId, Chunk>;
@@ -193,6 +197,9 @@ class Metadata : public rpc::MetadataRpc {
       Tier tier,
       std::optional<Clock::duration> period = std::nullopt);
 
+  // Marks the bucket released and its chunks ephemeral.
+  void releaseBucketLocked(BucketId bucket);
+
   void eraseChunkLocked(
       ChunkMap::iterator chunk,
       std::optional<Clock::duration> period = std::nullopt);
@@ -228,6 +235,8 @@ class Metadata : public rpc::MetadataRpc {
   ChunkMap chunks_;
   // The chunks of each bucket.
   std::map<BucketId, std::unordered_set<ChunkId>> buckets_;
+  // Those whose chunks are ephemeral (co_releaseBucket).
+  std::set<BucketId> releasedBuckets_;
   BucketId nextBucket_{1};
   // Per tier of blocks, least recently used first.
   LruList lru_[kBlockTiers];

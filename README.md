@@ -219,6 +219,11 @@ chunk's blocks. The bucket is hashed into a chunk's id, so equal bytes in
 two buckets are two chunks, and deleting one bucket never takes another's
 chunk. Buckets are journaled like refs.
 
+`co_releaseBucket(id)` keeps a bucket but makes its chunks, and those
+committed into it later, ephemeral (see Eviction): e.g. a job's retained
+output that later jobs may read again, but that Kiln may now evict like a
+cache.
+
 ```cpp
 const auto bucket = co_await client.co_createBucket();
 auto writer = co_await client.co_create(bucket);

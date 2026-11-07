@@ -176,6 +176,10 @@ service MetadataService {
     1: KilnException e,
   );
 
+  /// Makes the bucket's chunks, and those committed into it later,
+  /// ephemeral; returns whether it exists.
+  bool releaseBucket(1: i64 bucket) throws (1: KilnException e);
+
   RefLookup getRef(1: string name) throws (1: KilnException e);
 
   /// Sets the ref if its version is the expected one; returns the updated

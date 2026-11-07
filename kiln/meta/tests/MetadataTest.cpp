@@ -555,6 +555,116 @@ TEST(MetadataTest, retainedCopiesGoOnInTheOverflowTier) {
   EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 2);
 }
 
+TEST(MetadataTest, releasedBucketsHoldEphemeralChunks) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {4});
+  const auto job = blockingWait(metadata.co_createBucket());
+  const auto output =
+      commit(metadata, 1, 2, Tier::kDram, job, Retention::kRetained);
+  const auto kept = commitRetained(metadata, 2, 2);
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_allocate(Tier::kDram, 1);
+      }()),
+      ErrorCode::kOutOfSpace);
+
+  EXPECT_TRUE(blockingWait(metadata.co_releaseBucket(job)));
+  EXPECT_EQ(
+      blockingWait(metadata.co_lookup(output)).placement.retention,
+      Retention::kEphemeral);
+  // Chunks committed into it later are ephemeral too.
+  EXPECT_TRUE(blockingWait(metadata.co_remove(kept)));
+  const auto late =
+      commit(metadata, 3, 2, Tier::kDram, job, Retention::kRetained);
+  EXPECT_EQ(
+      blockingWait(metadata.co_lookup(late)).placement.retention,
+      Retention::kEphemeral);
+  // The job's chunks make room for a retained one.
+  commitRetained(metadata, 4, 2);
+  EXPECT_EQ(metadata.evictions(), 1);
+  EXPECT_FALSE(exists(metadata, output));
+
+  EXPECT_FALSE(blockingWait(metadata.co_releaseBucket(job + 1)));
+  EXPECT_EQ(
+      errorOf([&]() -> folly::coro::Task<void> {
+        co_await metadata.co_releaseBucket(kDefaultBucket);
+      }()),
+      ErrorCode::kInvalidArgument);
+}
+
+TEST(MetadataTest, releasedOverflowedCopiesAreEvictedFromEitherTier) {
+  Metadata metadata(exact());
+  registerServer(metadata, "a:1", Tier::kDram, {2});
+  registerServer(metadata, "b:1", Tier::kLocalFs, {2});
+  const auto job = blockingWait(metadata.co_createBucket());
+  // In DRAM, going on in local FS.
+  Replica copy{.tier = Tier::kDram};
+  for (auto tier : {Tier::kDram, Tier::kLocalFs, Tier::kLocalFs}) {
+    copy.blocks.push_back(blockingWait(metadata.co_allocate(tier, 1))[0]);
+  }
+  const auto chunk = blockingWait(metadata.co_commit(ChunkInfo{
+                                      .id = ChunkId{1, 1},
+                                      .bucket = job,
+                                      .size = 3 * kBlockSize,
+                                      .replicas = {copy}}))
+                         .id;
+  EXPECT_TRUE(blockingWait(metadata.co_releaseBucket(job)));
+  // Local FS needs room: the whole copy goes, its DRAM block too.
+  blockingWait(metadata.co_allocate(Tier::kLocalFs, 1));
+  EXPECT_FALSE(exists(metadata, chunk));
+  EXPECT_EQ(metadata.evictions(), 1);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kDram), 2);
+  EXPECT_EQ(metadata.freeBlocks(Tier::kLocalFs), 1);
+}
+
+TEST(MetadataTest, journalKeepsReleasedBuckets) {
+  folly::test::TemporaryDirectory dir;
+  MetadataOptions options = exact();
+  options.journal = dir.path().string() + "/journal";
+  std::vector<RegionInfo> regions;
+  BucketId job;
+  ChunkId output;
+  {
+    Metadata metadata(options);
+    registerServer(metadata, "a:1", Tier::kDram, {4});
+    regions = registerServer(metadata, "b:1", Tier::kLocalFs, {4});
+    job = blockingWait(metadata.co_createBucket());
+    output = blockingWait(
+                 metadata.co_commit(ChunkInfo{
+                     .id = ChunkId{1, 1},
+                     .bucket = job,
+                     .size = kBlockSize,
+                     .placement =
+                         {.tier = Tier::kDram, .writeThrough = Tier::kLocalFs},
+                     .replicas = {
+                         Replica{
+                             .tier = Tier::kDram,
+                             .blocks = blockingWait(
+                                 metadata.co_allocate(Tier::kDram, 1))},
+                         Replica{
+                             .tier = Tier::kLocalFs,
+                             .blocks = blockingWait(
+                                 metadata.co_allocate(Tier::kLocalFs, 1))}}}))
+                 .id;
+    EXPECT_TRUE(blockingWait(metadata.co_releaseBucket(job)));
+  }
+  // Replayed from the appended records, then from the rewritten journal.
+  for (int restart = 0; restart < 2; ++restart) {
+    Metadata metadata(options);
+    blockingWait(metadata.co_registerServer(regions, 0));
+    EXPECT_EQ(
+        blockingWait(metadata.co_lookup(output)).placement.retention,
+        Retention::kEphemeral);
+    // Later commits into the bucket are ephemeral too.
+    registerServer(metadata, "a:2", Tier::kDram, {4});
+    const auto late = commit(
+        metadata, 2 + restart, 1, Tier::kDram, job, Retention::kRetained);
+    EXPECT_EQ(
+        blockingWait(metadata.co_lookup(late)).placement.retention,
+        Retention::kEphemeral);
+  }
+}
+
 TEST(MetadataTest, journalKeepsRetention) {
   folly::test::TemporaryDirectory dir;
   MetadataOptions options = exact();

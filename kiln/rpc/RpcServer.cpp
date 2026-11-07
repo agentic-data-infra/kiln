@@ -121,6 +121,11 @@ class MetadataService
         static_cast<BucketId>(bucket), std::chrono::milliseconds(graceMs)));
   }
 
+  folly::coro::Task<bool> co_releaseBucket(int64_t bucket) override {
+    co_return co_await guarded(
+        metadata_->co_releaseBucket(static_cast<BucketId>(bucket)));
+  }
+
   folly::coro::Task<std::unique_ptr<thrift::RefLookup>> co_getRef(
       std::unique_ptr<std::string> name) override {
     auto result = co_await guarded(metadata_->co_getRef(std::move(*name)));

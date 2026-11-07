@@ -136,6 +136,11 @@ class Client {
       BucketId bucket,
       std::chrono::milliseconds grace = {});
 
+  // Makes the bucket's chunks, and those committed into it later,
+  // ephemeral: they stay until removed or evicted. Returns whether the
+  // bucket exists.
+  folly::coro::Task<bool> co_releaseBucket(BucketId bucket);
+
   // Refs: small named values on the metadata server, updated with compare
   // and swap (see Ref and rpc::MetadataRpc).
 
