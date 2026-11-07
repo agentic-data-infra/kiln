@@ -27,8 +27,9 @@ enum RecordKind : uint8_t {
   // A region's id.
   kRegionRemoved = 5,
   // A written-through chunk's id, size and placement, and its copy in the
-  // write-through tier; then its bucket, unless that is the default one
-  // (records from before buckets end there).
+  // write-through tier; then its bucket and retention (records from before
+  // buckets end before the bucket if it is the default one, and those from
+  // before retention before it).
   kChunkSet = 6,
   // A chunk's id: its copy in the write-through tier is gone.
   kChunkRemoved = 7,
@@ -85,9 +86,7 @@ RecordWriter chunkRecord(const ChunkInfo& chunk, const Replica& replica) {
   for (const auto& block : replica.blocks) {
     record.u64(block.region).u64(block.offset).u64(block.length);
   }
-  if (chunk.bucket != kDefaultBucket) {
-    record.u64(chunk.bucket);
-  }
+  record.u64(chunk.bucket).u8(static_cast<uint8_t>(chunk.placement.retention));
   return record;
 }
 
@@ -171,7 +170,16 @@ void Metadata::replay(folly::ByteRange record) {
       }
       if (!reader.done()) {
         info.bucket = reader.u64();
-        buckets_[info.bucket].insert(info.id);
+        if (info.bucket != kDefaultBucket) {
+          buckets_[info.bucket].insert(info.id);
+        }
+      }
+      if (!reader.done()) {
+        const auto retention = reader.u8();
+        if (retention > static_cast<uint8_t>(Retention::kEphemeral)) {
+          throw Error(ErrorCode::kInternal, "Bad retention in journal record");
+        }
+        info.placement.retention = static_cast<Retention>(retention);
       }
       auto it = chunks_.find(info.id);
       if (it != chunks_.end()) {
@@ -477,7 +485,8 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
     throw Error(
         ErrorCode::kOutOfSpace,
         fmt::format(
-            "Asked for {} blocks in {}: {} of {} are in chunks being written",
+            "Asked for {} blocks in {}: {} of {} are in chunks being written "
+            "or retained",
             count,
             toString(tier),
             budget - available(),
@@ -559,8 +568,10 @@ void Metadata::evictLocked(Tier tier, uint64_t available) {
           return r.tier == tier;
         });
     // Dropping copies on servers that have not registered (again) frees
-    // nothing here.
-    if (readableLocked(*replica)) {
+    // nothing here. A retained chunk keeps its last copy.
+    if (readableLocked(*replica) &&
+        (chunk->second.info.placement.retention == Retention::kEphemeral ||
+         replicas.size() > 1)) {
       dropReplicaLocked(chunk, tier);
       ++evictions_;
     }
@@ -738,13 +749,22 @@ folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
       }
       continue;
     }
+    // The copy of a retained chunk may go on in another tier where its own
+    // was full (Placement::overflow).
+    const bool mayOverflow =
+        placement.retention == Retention::kRetained && !placement.writeThrough;
+    auto tier = replica.tier;
     uint64_t size = 0;
     for (const auto& block : replica.blocks) {
       auto it = regions_.find(block.region);
+      if (it != regions_.end() && it->second.info.tier != tier && mayOverflow &&
+          tier == replica.tier && size > 0) {
+        tier = it->second.info.tier;
+      }
       if (it == regions_.end() || block.offset % kBlockSize != 0 ||
           block.length > kBlockSize ||
           block.offset + kBlockSize > it->second.info.length ||
-          it->second.info.tier != replica.tier) {
+          it->second.info.tier != tier) {
         throw Error(
             ErrorCode::kInvalidArgument,
             fmt::format(

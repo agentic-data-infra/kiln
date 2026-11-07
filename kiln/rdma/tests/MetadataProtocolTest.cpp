@@ -26,7 +26,10 @@ ChunkInfo chunk(uint64_t size) {
   ChunkInfo info{
       .id = ChunkId{.high = 0x0123456789abcdef, .low = 42},
       .size = size,
-      .placement = Placement{.tier = Tier::kDram, .writeThrough = Tier::kLocalFs}};
+      .placement = Placement{
+          .tier = Tier::kDram,
+          .writeThrough = Tier::kLocalFs,
+          .retention = Retention::kEphemeral}};
   info.replicas.push_back(Replica{.tier = Tier::kDram, .blocks = chunkBlocks(size)});
   info.replicas.push_back(
       Replica{.tier = Tier::kLocalFs, .blocks = chunkBlocks(size)});

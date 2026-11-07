@@ -235,6 +235,34 @@ TEST_F(RdmaTest, readsLocalFsOverTcp) {
   EXPECT_EQ(client_->stats().rdmaBytes, 0);
 }
 
+// A retained chunk that overflowed: its DRAM blocks go over RDMA, its
+// local-FS ones over TCP.
+TEST_F(RdmaTest, overflowedChunksMixTransports) {
+  local::LocalCluster cluster(local::LocalClusterOptions{
+      .dramServers = 1,
+      .localFsServers = 1,
+      .regionSize = 8 << 20,
+      .metadata = meta::MetadataOptions{.gracePeriod = std::chrono::milliseconds(0)},
+      .rdma = true});
+  Client client(ClientOptions{
+      .metadata = cluster.metadataEndpoint(), .useShm = false});
+  const auto data = pattern(12 << 20, 6);
+  auto writer = blockingWait(client.co_create(
+      kDefaultBucket, Placement{.tier = Tier::kDram, .overflow = Tier::kLocalFs}));
+  auto buffer = client.allocateBuffer(1 << 20);
+  for (size_t done = 0; done < data.size(); done += 1 << 20) {
+    std::memcpy(buffer.data(), data.data() + done, 1 << 20);
+    buffer.setSize(1 << 20);
+    buffer = blockingWait(writer->co_append(std::move(buffer)));
+  }
+  const auto id = blockingWait(writer->co_commit());
+  auto read = blockingWait(client.co_read(
+      id, 0, data.size(), client.allocateBuffer(data.size())));
+  EXPECT_EQ(std::memcmp(read.data(), data.data(), data.size()), 0);
+  // 8 MiB written and read in DRAM.
+  EXPECT_EQ(client.stats().rdmaBytes, 2 * (8 << 20));
+}
+
 // The whole client with the metadata calls over RDMA too: nothing goes over
 // TCP but the storage servers' registrations.
 TEST_F(RdmaTest, makesMetadataCallsOverRdma) {

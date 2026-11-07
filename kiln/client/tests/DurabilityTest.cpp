@@ -152,7 +152,7 @@ TEST_F(DurabilityTest, readsFallBackToTheWriteThroughCopy) {
   EXPECT_EQ(
       blockingWait(objectStore_->co_head(chunkObjectKey(idC))), c.size());
 
-  const auto idB = put(b, Placement{});
+  const auto idB = put(b, Placement{.retention = Retention::kEphemeral});
   EXPECT_EQ(tiersOf(idA), std::vector{Tier::kLocalFs});
   EXPECT_EQ(tiersOf(idC), std::vector{Tier::kObjectStore});
   EXPECT_EQ(get(idA), a);
@@ -172,8 +172,8 @@ TEST_F(DurabilityTest, survivesRestarts) {
   const auto b = bytes(2 << 20, 'b');
   const auto idA = put(a, kToLocalFs);
   const auto idB = put(b, kToObjectStore);
-  const auto ephemeralDram = put(bytes(1 << 20, 'c'), Placement{});
-  const auto ephemeralLocalFs =
+  const auto dramOnly = put(bytes(1 << 20, 'c'), Placement{});
+  const auto localFsOnly =
       put(bytes(1 << 20, 'd'), Placement{.tier = Tier::kLocalFs});
 
   stopServers();
@@ -185,8 +185,8 @@ TEST_F(DurabilityTest, survivesRestarts) {
   EXPECT_EQ(get(idA), a);
   EXPECT_EQ(tiersOf(idB), std::vector{Tier::kObjectStore});
   EXPECT_EQ(get(idB), b);
-  EXPECT_EQ(statError(ephemeralDram), ErrorCode::kNotFound);
-  EXPECT_EQ(statError(ephemeralLocalFs), ErrorCode::kNotFound);
+  EXPECT_EQ(statError(dramOnly), ErrorCode::kNotFound);
+  EXPECT_EQ(statError(localFsOnly), ErrorCode::kNotFound);
 
   // New chunks fill the local FS around A's blocks.
   const auto e = bytes(12 << 20, 'e');

@@ -22,7 +22,8 @@ object store interface (`kiln/objectstore`) with a local-directory backend;
 and the client, which reaches regions over TCP, with one-sided RDMA (DRAM
 regions, in a build with RDMA), or, on the same host, by mapping their
 files. Tiers fill up to the storage servers' byte budgets and
-then evict their least recently used chunks. Chunks can be written through
+then evict their least recently used ephemeral chunks; retained chunks are
+never lost to eviction. Chunks can be written through
 to a durable tier, and refs and written-through chunks survive restarts.
 The catalog keeps memos of results and datasets of named files (below).
 
@@ -40,13 +41,15 @@ auto writer = co_await client.co_create(
     {.tier = kiln::Tier::kDram, .writeThrough = kiln::Tier::kLocalFs});
 ```
 
-With `Placement::overflow`, a chunk goes into its tier only if it fits into
-the blocks free there, without evicting anything; else all of it goes into
-the overflow tier, which evicts as usual. The metadata server checks and
-takes the blocks in one step, so concurrent writers never see a stale
-"full". The decision is made by the chunk's first allocation, so give
-`co_create` the chunk's size when you know it: the first append then
-allocates blocks for all of it (blocks left over are freed at commit).
+With `Placement::overflow`, an allocation goes into the chunk's tier only if
+it fits into the blocks free there, without evicting anything; else into the
+overflow tier, which evicts as usual. The metadata server checks and takes
+the blocks in one step, so concurrent writers never see a stale "full". For
+an ephemeral chunk the first allocation decides for all of it; a retained
+chunk (below) decides at every allocation until it overflowed, so its copy
+may start in DRAM and go on in the local FS. Give `co_create` the chunk's
+size when you know it: the first append then allocates blocks for all of it
+(blocks left over are freed at commit), and the chunk lands in one tier.
 
 ```cpp
 auto writer = co_await client.co_create(
@@ -59,6 +62,13 @@ Eviction drops a chunk's copy in one tier; the chunk is gone when it has no
 copy left. A written-through chunk whose DRAM copy was evicted is still read
 from its other copy, and writing the same bytes again brings the DRAM copy
 back.
+
+`Placement::retention` says whether eviction may drop a chunk's last copy.
+A retained chunk (the default), e.g. shuffle data a job still needs, never
+loses it: a tier full of retained chunks takes no more blocks, and an
+allocation there overflows if the placement says where to, or fails with
+`kOutOfSpace`. An ephemeral chunk, e.g. a cached result that can be computed
+again, is evicted when its tier fills.
 
 With a journal (`kiln_meta --journal=FILE`), the metadata server keeps the
 copies of written-through chunks in their write-through tier, along with
@@ -221,9 +231,9 @@ co_await client.co_deleteBucket(bucket);
 Each storage server registers its regions with a byte budget (`kiln_server
 --budget_mb`, default all of its regions). When an allocation would leave
 less than 10% of a tier's budget free, the metadata server evicts the tier's
-least recently committed or looked up chunks there until 20% is free. A
-chunk evicted from its only tier is gone: `co_stat` and `co_read` fail with
-`kNotFound`.
+least recently committed or looked up chunks there until 20% is free,
+skipping the last copies of retained chunks. An ephemeral chunk evicted from
+its only tier is gone: `co_stat` and `co_read` fail with `kNotFound`.
 
 The blocks of an evicted or removed chunk are reused only after a grace
 period (`kiln_meta --grace_period_s`, default 30 s). Clients cache a chunk's
@@ -232,7 +242,7 @@ a reader that found the chunk just before it went still reads its bytes, and
 lookups after the TTL tell the metadata server which chunks are in use. An
 allocation that only blocks in their grace period could satisfy waits for
 them; one that even evicting everything cannot satisfy (the tier is full of
-chunks being written) fails with `kOutOfSpace`.
+chunks being written or retained) fails with `kOutOfSpace`.
 
 ## Memos
 

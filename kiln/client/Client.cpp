@@ -466,13 +466,29 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
   }
   if (size > room) {
     auto count = (size - room + kBlockSize - 1) / kBlockSize;
+    // The first allocation may overflow, and so may those of a retained
+    // chunk until it did.
     std::optional<Tier> overflow;
     if (blocks.empty()) {
       count = std::max(count, (sizeHint_ + kBlockSize - 1) / kBlockSize);
       overflow = placement_.overflow;
+    } else if (placement_.retention == Retention::kRetained && !tail_) {
+      overflow = placement_.overflow;
     }
     auto allocated = co_await client_.metadata_->co_allocate(
-        replica.tier, static_cast<uint32_t>(count), overflow);
+        tail_.value_or(replica.tier), static_cast<uint32_t>(count), overflow);
+    if (overflow) {
+      // A named argument: GCC 12 destroys temporaries in a co_await's
+      // arguments twice.
+      const std::vector<BlockRef> head{allocated.front()};
+      const auto tier = (co_await client_.co_regions(head))[0].tier;
+      if (blocks.empty()) {
+        replica.tier = tier;
+        placement_.tier = tier;
+      } else if (tier != replica.tier) {
+        tail_ = tier;
+      }
+    }
     for (auto& block : allocated) {
       block.length = 0;
       blocks.push_back(block);
@@ -486,12 +502,6 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
   }
   std::vector<BlockRef> touched(blocks.begin() + first, blocks.begin() + last);
   const auto regions = co_await client_.co_regions(touched);
-  if (placement_.overflow) {
-    // The first allocation chose the tier; later ones stay in it.
-    replica.tier = regions[0].tier;
-    placement_.tier = replica.tier;
-    placement_.overflow.reset();
-  }
 
   // One write per block and piece it spans: each from one piece's memory.
   std::vector<folly::coro::Task<void>> writes;
