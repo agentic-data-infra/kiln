@@ -276,6 +276,10 @@ folly::coro::Task<bool> Client::co_deleteBucket(
   co_return co_await metadata_->co_deleteBucket(bucket, grace);
 }
 
+folly::coro::Task<bool> Client::co_releaseBucket(BucketId bucket) {
+  co_return co_await metadata_->co_releaseBucket(bucket);
+}
+
 folly::coro::Task<std::optional<Ref>> Client::co_getRef(std::string name) {
   co_return co_await metadata_->co_getRef(std::move(name));
 }

@@ -37,6 +37,7 @@ enum class MetadataOp : uint8_t {
   kRemoveRef,
   kCreateBucket,
   kDeleteBucket,
+  kReleaseBucket,
 };
 
 // A request's or response's bytes, as rlib's RPC sends them.

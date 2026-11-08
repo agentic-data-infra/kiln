@@ -286,6 +286,36 @@ TEST_P(RetentionTest, writtenThroughChunksLoseTheirDramCopy) {
   EXPECT_TRUE(get(idA) == a);
 }
 
+TEST_P(RetentionTest, releasedBucketsAreEvicted) {
+  // A job's retained output fills DRAM.
+  const auto job = blockingWait(client_.co_createBucket());
+  auto putIn = [&](BucketId bucket, const std::string& data) {
+    auto writer = blockingWait(client_.co_create(bucket));
+    auto buffer = client_.allocateBuffer(data.size());
+    std::memcpy(buffer.data(), data.data(), data.size());
+    buffer.setSize(data.size());
+    blockingWait(writer->co_append(std::move(buffer)));
+    return blockingWait(writer->co_commit());
+  };
+  const auto a = putIn(job, bytes(4 << 20, 'a'));
+  const auto b = putIn(job, bytes(4 << 20, 'b'));
+  EXPECT_THROW(put(bytes(1 << 20, 'c')), Error);
+
+  // Kept after the job, but evictable: the next write evicts A, the least
+  // recently used.
+  EXPECT_TRUE(blockingWait(client_.co_releaseBucket(job)));
+  EXPECT_EQ(
+      blockingWait(cluster_.metadata().co_lookup(b)).placement.retention,
+      Retention::kEphemeral);
+  const auto c = bytes(1 << 20, 'c');
+  const auto idC = put(c);
+  EXPECT_EQ(cluster_.metadata().evictions(), 1);
+  EXPECT_TRUE(get(idC) == c);
+  std::this_thread::sleep_for(100ms); // Past the client's cache TTL.
+  EXPECT_FALSE(blockingWait(cluster_.metadata().co_remove(a)));
+  EXPECT_TRUE(get(b) == bytes(4 << 20, 'b'));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     Transports,
     RetentionTest,

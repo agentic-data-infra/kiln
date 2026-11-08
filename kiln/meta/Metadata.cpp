@@ -40,6 +40,8 @@ enum RecordKind : uint8_t {
   // The id of the next bucket, so that ids of removed buckets are not
   // reused after the journal is rewritten.
   kNextBucket = 10,
+  // A bucket's id: its chunks are ephemeral (co_releaseBucket).
+  kBucketReleased = 11,
 };
 
 constexpr uint8_t kNoTier = 0xff;
@@ -205,8 +207,14 @@ void Metadata::replay(folly::ByteRange record) {
       nextBucket_ = std::max(nextBucket_, bucket + 1);
       break;
     }
-    case kBucketRemoved:
-      buckets_.erase(reader.u64());
+    case kBucketRemoved: {
+      const auto bucket = reader.u64();
+      buckets_.erase(bucket);
+      releasedBuckets_.erase(bucket);
+      break;
+    }
+    case kBucketReleased:
+      releaseBucketLocked(reader.u64());
       break;
     case kNextBucket:
       nextBucket_ = std::max(nextBucket_, reader.u64());
@@ -225,6 +233,10 @@ std::vector<std::string> Metadata::snapshot() {
   records.push_back(RecordWriter().u8(kNextBucket).u64(nextBucket_).record());
   for (const auto& [bucket, chunks] : buckets_) {
     records.push_back(RecordWriter().u8(kBucketSet).u64(bucket).record());
+    if (releasedBuckets_.contains(bucket)) {
+      records.push_back(
+          RecordWriter().u8(kBucketReleased).u64(bucket).record());
+    }
   }
   for (const auto& [id, region] : regions_) {
     if (region.info.tier == Tier::kLocalFs) {
@@ -567,12 +579,16 @@ void Metadata::evictLocked(Tier tier, uint64_t available) {
         replicas.begin(), replicas.end(), [&](const Replica& r) {
           return r.tier == tier;
         });
+    if (replica == replicas.end()) {
+      // The only copy, going on in this tier.
+      replica = replicas.begin();
+    }
     // Dropping copies on servers that have not registered (again) frees
     // nothing here. A retained chunk keeps its last copy.
     if (readableLocked(*replica) &&
         (chunk->second.info.placement.retention == Retention::kEphemeral ||
          replicas.size() > 1)) {
-      dropReplicaLocked(chunk, tier);
+      dropReplicaLocked(chunk, replica->tier);
       ++evictions_;
     }
   }
@@ -650,10 +666,16 @@ void Metadata::freeLocked(
 }
 
 void Metadata::addReplicaLocked(Chunk& chunk, Replica replica) {
-  if (hasBlocks(replica.tier)) {
-    auto& lru = lruOf(replica.tier);
-    lru.push_back(chunk.info.id);
-    chunk.lru[static_cast<size_t>(replica.tier)] = std::prev(lru.end());
+  for (const auto& block : replica.blocks) {
+    auto region = regions_.find(block.region);
+    const auto tier =
+        region == regions_.end() ? replica.tier : region->second.info.tier;
+    auto& entry = chunk.lru[static_cast<size_t>(tier)];
+    if (!entry) {
+      auto& lru = lruOf(tier);
+      lru.push_back(chunk.info.id);
+      entry = std::prev(lru.end());
+    }
   }
   if (chunk.info.placement.writeThrough == replica.tier) {
     append(chunkRecord(chunk.info, replica));
@@ -677,10 +699,20 @@ Metadata::ChunkMap::iterator Metadata::dropReplicaLocked(
   if (replica == info.replicas.end()) {
     return std::next(chunk);
   }
-  if (hasBlocks(tier)) {
-    lruOf(tier).erase(chunk->second.lru[static_cast<size_t>(tier)]);
-    freeLocked(replica->blocks, /*grace=*/true, period);
+  // Out of the LRU lists of the tiers no other copy is in: of its own,
+  // and, for a copy that went on in its overflow tier, of that one.
+  for (size_t i = 0; i < kBlockTiers; ++i) {
+    auto& entry = chunk->second.lru[i];
+    const bool other = std::any_of(
+        info.replicas.begin(), info.replicas.end(), [&](const Replica& r) {
+          return r.tier == static_cast<Tier>(i) && &r != &*replica;
+        });
+    if (entry && !other) {
+      lruOf(static_cast<Tier>(i)).erase(*entry);
+      entry.reset();
+    }
   }
+  freeLocked(replica->blocks, /*grace=*/true, period);
   if (info.placement.writeThrough == tier) {
     append(RecordWriter().u8(kChunkRemoved).u64(info.id.high).u64(info.id.low));
   }
@@ -798,6 +830,9 @@ folly::coro::Task<ChunkInfo> Metadata::co_commit(ChunkInfo chunk) {
           fmt::format("No bucket {}", chunk.bucket));
     }
     bucket->second.insert(chunk.id);
+    if (releasedBuckets_.contains(chunk.bucket)) {
+      chunk.placement.retention = Retention::kEphemeral;
+    }
   }
 
   auto it = chunks_.find(chunk.id);
@@ -855,11 +890,10 @@ folly::coro::Task<ChunkInfo> Metadata::co_lookup(ChunkId id) {
             "The storage servers of chunk {} have not registered",
             id.toString()));
   }
-  for (const auto& replica : result.replicas) {
-    if (hasBlocks(replica.tier)) {
-      auto& lru = lruOf(replica.tier);
-      lru.splice(
-          lru.end(), lru, it->second.lru[static_cast<size_t>(replica.tier)]);
+  for (size_t i = 0; i < kBlockTiers; ++i) {
+    if (const auto& entry = it->second.lru[i]) {
+      auto& lru = lruOf(static_cast<Tier>(i));
+      lru.splice(lru.end(), lru, *entry);
     }
   }
   co_return result;
@@ -904,8 +938,37 @@ folly::coro::Task<bool> Metadata::co_deleteBucket(
     }
   }
   buckets_.erase(bucket);
+  releasedBuckets_.erase(id);
   append(RecordWriter().u8(kBucketRemoved).u64(id));
   co_return true;
+}
+
+folly::coro::Task<bool> Metadata::co_releaseBucket(BucketId id) {
+  if (id == kDefaultBucket) {
+    throw Error(
+        ErrorCode::kInvalidArgument, "The default bucket cannot be released");
+  }
+  std::lock_guard lock(mutex_);
+  if (!buckets_.contains(id)) {
+    co_return false;
+  }
+  releaseBucketLocked(id);
+  append(RecordWriter().u8(kBucketReleased).u64(id));
+  co_return true;
+}
+
+void Metadata::releaseBucketLocked(BucketId id) {
+  auto bucket = buckets_.find(id);
+  if (bucket == buckets_.end()) {
+    return;
+  }
+  releasedBuckets_.insert(id);
+  for (const auto& chunk : bucket->second) {
+    auto it = chunks_.find(chunk);
+    if (it != chunks_.end()) {
+      it->second.info.placement.retention = Retention::kEphemeral;
+    }
+  }
 }
 
 folly::coro::Task<std::optional<Ref>> Metadata::co_getRef(std::string name) {

@@ -189,6 +189,12 @@ class RemoteMetadata : public MetadataRpc {
             static_cast<int64_t>(bucket), static_cast<int64_t>(grace.count())));
   }
 
+  folly::coro::Task<bool> co_releaseBucket(BucketId bucket) override {
+    auto client = connection_.client();
+    co_return co_await connection_.translated(
+        client, client->co_releaseBucket(static_cast<int64_t>(bucket)));
+  }
+
   folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) override {
     auto client = connection_.client();
     co_return fromThrift(

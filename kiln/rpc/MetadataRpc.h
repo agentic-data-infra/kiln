@@ -72,6 +72,11 @@ class MetadataRpc {
       BucketId bucket,
       std::chrono::milliseconds grace = {}) = 0;
 
+  // Makes the bucket's chunks, and those committed into it later, ephemeral
+  // (Retention): they stay until removed or evicted. Returns whether the
+  // bucket exists; fails with kInvalidArgument for the default bucket.
+  virtual folly::coro::Task<bool> co_releaseBucket(BucketId bucket) = 0;
+
   // The ref, or nullopt if there is none.
   virtual folly::coro::Task<std::optional<Ref>> co_getRef(std::string name) = 0;
 

@@ -292,6 +292,11 @@ TEST_F(RdmaTest, makesMetadataCallsOverRdma) {
   ASSERT_EQ(refs.size(), 40);
   EXPECT_EQ(refs.back().name, "rdma/39");
   EXPECT_TRUE(blockingWait(client_->co_remove(id)));
+
+  const auto bucket = blockingWait(client_->co_createBucket());
+  EXPECT_TRUE(blockingWait(client_->co_releaseBucket(bucket)));
+  EXPECT_TRUE(blockingWait(client_->co_deleteBucket(bucket)));
+  EXPECT_FALSE(blockingWait(client_->co_releaseBucket(bucket)));
 }
 
 // Which way the metadata calls and the data go, by the URLs and switches.
