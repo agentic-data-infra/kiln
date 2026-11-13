@@ -111,6 +111,28 @@ Placement fromThrift(const thrift::Placement& placement) {
   return result;
 }
 
+thrift::Stick toThrift(const Stick& stick) {
+  thrift::Stick result;
+  if (stick.region) {
+    result.region() = static_cast<int64_t>(*stick.region);
+  }
+  if (stick.host) {
+    result.host() = *stick.host;
+  }
+  return result;
+}
+
+Stick fromThrift(const thrift::Stick& stick) {
+  Stick result;
+  if (stick.region()) {
+    result.region = static_cast<RegionId>(*stick.region());
+  }
+  if (stick.host()) {
+    result.host = *stick.host();
+  }
+  return result;
+}
+
 thrift::Replica toThrift(const Replica& replica) {
   thrift::Replica result;
   result.tier() = static_cast<thrift::Tier>(replica.tier);

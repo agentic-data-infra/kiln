@@ -169,6 +169,11 @@ class Client {
       std::string name,
       std::optional<uint64_t> expectedVersion = std::nullopt);
 
+  // The regions of 'blocks' (e.g. where a chunk is: their servers and
+  // hosts), from the cache or the metadata server.
+  folly::coro::Task<std::vector<RegionInfo>> co_regions(
+      const std::vector<BlockRef>& blocks);
+
  private:
   friend class ChunkWriter;
 
@@ -179,10 +184,6 @@ class Client {
       uint64_t offset,
       uint64_t length,
       uint8_t* dst);
-
-  // The regions of 'blocks', from the cache or the metadata server.
-  folly::coro::Task<std::vector<RegionInfo>> co_regions(
-      const std::vector<BlockRef>& blocks);
 
   Transport& transportFor(const RegionInfo& region);
 

@@ -33,11 +33,13 @@ class MetadataRpc {
   // the tier's least recently used copies of chunks to make room; fails
   // with kOutOfSpace if that cannot make enough. With 'overflow', takes the
   // blocks from 'tier' only if they are free there without evicting, else
-  // from 'overflow' as above; the blocks' regions tell which.
+  // from 'overflow' as above; the blocks' regions tell which. With 'stick',
+  // takes the free blocks of one server first (Placement::sticky).
   virtual folly::coro::Task<std::vector<BlockRef>> co_allocate(
       Tier tier,
       uint32_t count,
-      std::optional<Tier> overflow = std::nullopt) = 0;
+      std::optional<Tier> overflow = std::nullopt,
+      std::optional<Stick> stick = std::nullopt) = 0;
 
   // Returns blocks from co_allocate that no chunk uses.
   virtual folly::coro::Task<void> co_free(std::vector<BlockRef> blocks) = 0;

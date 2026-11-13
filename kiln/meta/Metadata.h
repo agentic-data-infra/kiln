@@ -76,7 +76,8 @@ class Metadata : public rpc::MetadataRpc {
   folly::coro::Task<std::vector<BlockRef>> co_allocate(
       Tier tier,
       uint32_t count,
-      std::optional<Tier> overflow = std::nullopt) override;
+      std::optional<Tier> overflow = std::nullopt,
+      std::optional<Stick> stick = std::nullopt) override;
 
   // Blocks that no reader has seen are reusable at once.
   folly::coro::Task<void> co_free(std::vector<BlockRef> blocks) override;
@@ -162,10 +163,12 @@ class Metadata : public rpc::MetadataRpc {
 
   // Tries to allocate under the lock. Returns the blocks, or how long to
   // wait for blocks in their grace period; throws kOutOfSpace if waiting
-  // would not help. Evicts to keep some of the tier free if 'evict'.
+  // would not help. Evicts to keep some of the tier free if 'evict'. Takes
+  // the blocks of one server first with 'stick'.
   std::optional<std::vector<BlockRef>> tryAllocateLocked(
       Tier tier,
       uint32_t count,
+      const std::optional<Stick>& stick,
       Clock::duration& wait,
       bool evict = true);
 

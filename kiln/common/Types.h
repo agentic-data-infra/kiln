@@ -175,13 +175,34 @@ enum class Retention {
 // so the chunk is in one tier. A retained chunk decides at every
 // allocation: it may start in 'tier' and go on in 'overflow'. The committed
 // chunk's placement names the tier it starts in.
+//
+// With 'sticky', a chunk's blocks go to one server: its first allocation
+// picks the next server round robin with room for them, and every
+// allocation takes the free blocks of that server first, and of all
+// servers once it has none. 'preferredHost' makes a chunk sticky too, and
+// its first allocation picks a server on that host (the host name in the
+// regions' ShmAccess, localHostName() there) if one has room. Both decide
+// only where new blocks go (nothing moves afterwards) and, like 'overflow',
+// are not kept with the committed chunk.
 struct Placement {
   Tier tier{Tier::kDram};
   std::optional<Tier> writeThrough;
   std::optional<Tier> overflow;
   Retention retention{Retention::kRetained};
+  bool sticky{false};
+  std::optional<std::string> preferredHost;
 
   bool operator==(const Placement&) const = default;
+};
+
+// An allocation that takes its blocks from one server first: with
+// 'region', that region's server (where a chunk's earlier blocks are), else
+// one on 'host' if set and one has room, else the next one round robin.
+struct Stick {
+  std::optional<RegionId> region;
+  std::optional<std::string> host;
+
+  bool operator==(const Stick&) const = default;
 };
 
 // A copy of a chunk in one tier: its bytes are the blocks' bytes in order,

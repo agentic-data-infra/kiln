@@ -89,6 +89,13 @@ struct Placement {
   3: Retention retention;
 }
 
+/// An allocation's server: that of 'region', else one on 'host', else the
+/// next one round robin.
+struct Stick {
+  1: optional i64 region;
+  2: optional string host;
+}
+
 struct Replica {
   1: Tier tier;
   2: list<BlockRef> blocks;
@@ -148,6 +155,8 @@ service MetadataService {
     1: Tier tier,
     2: i32 count,
     3: list<Tier> overflow,
+    /// At most one: take the blocks of one server first (Stick).
+    4: list<Stick> stick,
   ) throws (
     1: KilnException e,
   );

@@ -414,7 +414,8 @@ folly::coro::Task<std::vector<RegionInfo>> Metadata::co_getRegions(
 folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
     Tier tier,
     uint32_t count,
-    std::optional<Tier> overflow) {
+    std::optional<Tier> overflow,
+    std::optional<Stick> stick) {
   for (auto t : {std::optional<Tier>(tier), overflow}) {
     if (t && !hasBlocks(*t)) {
       throw Error(
@@ -430,7 +431,7 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
     if (freeBlocksLocked(tier) >= count) {
       Clock::duration wait;
       co_return std::move(
-          *tryAllocateLocked(tier, count, wait, /*evict=*/false));
+          *tryAllocateLocked(tier, count, stick, wait, /*evict=*/false));
     }
     tier = *overflow;
   }
@@ -442,7 +443,7 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
     Clock::duration wait;
     {
       std::lock_guard lock(mutex_);
-      if (auto blocks = tryAllocateLocked(tier, count, wait)) {
+      if (auto blocks = tryAllocateLocked(tier, count, stick, wait)) {
         co_return std::move(*blocks);
       }
     }
@@ -464,6 +465,7 @@ folly::coro::Task<std::vector<BlockRef>> Metadata::co_allocate(
 std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
     Tier tier,
     uint32_t count,
+    const std::optional<Stick>& stick,
     Clock::duration& wait,
     bool evict) {
   const auto now = Clock::now();
@@ -522,7 +524,7 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
   }
 
   // Round robin over the tier's regions, starting after where the last
-  // allocation ended.
+  // allocation ended: with 'stick', first over those of one server.
   std::vector<std::pair<Region*, Server*>> candidates;
   auto consider = [&](Region& region) {
     auto* server = serverOf(region.info.id);
@@ -540,22 +542,70 @@ std::optional<std::vector<BlockRef>> Metadata::tryAllocateLocked(
     consider(it->second);
   }
 
+  auto hasFree = [](const Region& region, const Server& server) {
+    return !region.free.empty() &&
+        server.liveBlocks + server.graceBlocks < server.budgetBlocks;
+  };
+  size_t first = 0;  // candidates[0, first) are the stuck server's
+  if (stick) {
+    const Server* stuck = nullptr;
+    if (stick->region) {
+      stuck = serverOf(*stick->region);
+    } else {
+      // The first server in round-robin order with room for all the blocks
+      // over one with some, on the host over not, and not the last
+      // allocation's (so that consecutive chunks take turns).
+      std::unordered_map<const Server*, uint64_t> room;
+      for (auto [region, server] : candidates) {
+        room[server] += region->free.size();
+      }
+      const auto* last = serverOf(nextAllocation_);
+      int best = 0;
+      for (auto [region, server] : candidates) {
+        const auto budget = server->budgetBlocks -
+            std::min(server->budgetBlocks,
+                     server->liveBlocks + server->graceBlocks);
+        const auto usable = std::min(room[server], budget);
+        const bool onHost = !stick->host ||
+            (region->info.shm && region->info.shm->host == *stick->host);
+        const int rank = usable == 0
+            ? 0
+            : 1 + 4 * (usable >= count) + 2 * onHost + (server != last);
+        if (rank > best) {
+          best = rank;
+          stuck = server;
+        }
+      }
+    }
+    first = std::stable_partition(
+                candidates.begin(),
+                candidates.end(),
+                [&](const auto& c) { return c.second == stuck; }) -
+        candidates.begin();
+  }
+
   std::vector<BlockRef> blocks;
   blocks.reserve(count);
-  for (size_t i = 0; blocks.size() < count; ++i) {
-    auto [region, server] = candidates[i % candidates.size()];
-    if (region->free.empty() ||
-        server->liveBlocks + server->graceBlocks >= server->budgetBlocks) {
-      continue;
+  // Round robin over the first n candidates until none has a free block.
+  auto take = [&](size_t n) {
+    for (size_t i = 0, full = 0; blocks.size() < count && full < n; ++i) {
+      auto [region, server] = candidates[i % n];
+      if (!hasFree(*region, *server)) {
+        ++full;
+        continue;
+      }
+      full = 0;
+      blocks.push_back(BlockRef{
+          .region = region->info.id,
+          .offset = region->free.back(),
+          .length = kBlockSize});
+      region->free.pop_back();
+      ++server->liveBlocks;
+      nextAllocation_ = region->info.id;
     }
-    blocks.push_back(BlockRef{
-        .region = region->info.id,
-        .offset = region->free.back(),
-        .length = kBlockSize});
-    region->free.pop_back();
-    ++server->liveBlocks;
-    nextAllocation_ = region->info.id;
-  }
+  };
+  take(first);
+  take(candidates.size());
   return blocks;
 }
 
