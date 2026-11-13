@@ -48,7 +48,17 @@ folly::coro::Task<std::string> co_dispatch(
       if (in.u8() != 0) {
         overflow = static_cast<Tier>(in.u8());
       }
-      out.blocks(co_await metadata.co_allocate(tier, count, overflow));
+      std::optional<Stick> stick;
+      if (in.u8() != 0) {
+        stick.emplace();
+        if (in.u8() != 0) {
+          stick->region = in.u64();
+        }
+        if (in.u8() != 0) {
+          stick->host = in.string();
+        }
+      }
+      out.blocks(co_await metadata.co_allocate(tier, count, overflow, stick));
       break;
     }
     case MetadataOp::kFree:
@@ -229,7 +239,8 @@ class RdmaMetadataClient : public rpc::MetadataRpc {
   folly::coro::Task<std::vector<BlockRef>> co_allocate(
       Tier tier,
       uint32_t count,
-      std::optional<Tier> overflow) override {
+      std::optional<Tier> overflow,
+      std::optional<Stick> stick) override {
     MessageWriter request;
     request.u8(static_cast<uint8_t>(MetadataOp::kAllocate))
         .u8(static_cast<uint8_t>(tier))
@@ -237,6 +248,17 @@ class RdmaMetadataClient : public rpc::MetadataRpc {
         .u8(overflow ? 1 : 0);
     if (overflow) {
       request.u8(static_cast<uint8_t>(*overflow));
+    }
+    request.u8(stick ? 1 : 0);
+    if (stick) {
+      request.u8(stick->region ? 1 : 0);
+      if (stick->region) {
+        request.u64(*stick->region);
+      }
+      request.u8(stick->host ? 1 : 0);
+      if (stick->host) {
+        request.string(*stick->host);
+      }
     }
     const auto response = co_await co_call(std::move(request));
     co_return readResponse(response).blocks();

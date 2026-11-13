@@ -70,17 +70,26 @@ class MetadataService
   co_allocate(
       thrift::Tier tier,
       int32_t count,
-      std::unique_ptr<std::vector<thrift::Tier>> overflow) override {
-    if (count < 0 || overflow->size() > 1) {
+      std::unique_ptr<std::vector<thrift::Tier>> overflow,
+      std::unique_ptr<std::vector<thrift::Stick>> sticks) override {
+    if (count < 0 || overflow->size() > 1 || sticks->size() > 1) {
       throw toThrift(Error(
-          ErrorCode::kInvalidArgument, "Negative count or overflow tiers"));
+          ErrorCode::kInvalidArgument,
+          "Negative count, overflow tiers or sticks"));
     }
     std::optional<Tier> overflowTier;
     if (!overflow->empty()) {
       overflowTier = static_cast<Tier>(overflow->front());
     }
+    std::optional<Stick> stick;
+    if (!sticks->empty()) {
+      stick = fromThrift(sticks->front());
+    }
     auto result = co_await guarded(metadata_->co_allocate(
-        static_cast<Tier>(tier), static_cast<uint32_t>(count), overflowTier));
+        static_cast<Tier>(tier),
+        static_cast<uint32_t>(count),
+        overflowTier,
+        stick));
     co_return boxed(toThrift(result));
   }
 

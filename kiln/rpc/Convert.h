@@ -24,6 +24,8 @@ thrift::ChunkId toThrift(const ChunkId& id);
 ChunkId fromThrift(const thrift::ChunkId& id);
 
 thrift::Placement toThrift(const Placement& placement);
+thrift::Stick toThrift(const Stick& stick);
+Stick fromThrift(const thrift::Stick& stick);
 Placement fromThrift(const thrift::Placement& placement);
 
 thrift::Replica toThrift(const Replica& replica);

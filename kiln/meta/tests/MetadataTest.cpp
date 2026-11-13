@@ -148,6 +148,81 @@ TEST(MetadataTest, allocateRoundRobin) {
   EXPECT_EQ(metadata.graceBlocks(Tier::kDram), 0);
 }
 
+TEST(MetadataTest, stickyAllocationsStayOnOneServer) {
+  Metadata metadata(exact());
+  std::map<RegionId, std::string> serverOf;
+  for (const auto* server : {"a:1", "b:1", "c:1"}) {
+    for (const auto& region : registerServer(metadata, server, Tier::kDram, {2, 2})) {
+      serverOf[region.id] = region.server;
+    }
+  }
+  auto servers = [&](const std::vector<BlockRef>& blocks) {
+    std::map<std::string, int> count;
+    for (const auto& block : blocks) {
+      ++count[serverOf.at(block.region)];
+    }
+    return count;
+  };
+
+  // Each sticky allocation on one server (over its regions), round robin.
+  std::set<std::string> used;
+  std::vector<BlockRef> firsts;
+  for (int i = 0; i < 3; ++i) {
+    auto blocks = blockingWait(metadata.co_allocate(Tier::kDram, 3, std::nullopt, Stick{}));
+    auto on = servers(blocks);
+    ASSERT_EQ(on.size(), 1);
+    EXPECT_EQ(on.begin()->second, 3);
+    used.insert(on.begin()->first);
+    firsts.push_back(blocks[0]);
+  }
+  EXPECT_EQ(used.size(), 3);
+  // Sticking to a region's server: its last block, then elsewhere.
+  auto more = blockingWait(metadata.co_allocate(
+      Tier::kDram, 2, std::nullopt, Stick{.region = firsts[0].region}));
+  auto on = servers(more);
+  EXPECT_EQ(on[serverOf.at(firsts[0].region)], 1);
+  EXPECT_EQ(on.size(), 2);
+}
+
+TEST(MetadataTest, stickyAllocationsPreferAHost) {
+  Metadata metadata(exact());
+  // Servers a:1 and a:2 on host "a", b:1 on "b"; two regions of 2 blocks each.
+  std::map<RegionId, std::string> serverOf;
+  for (auto [server, host] : {std::pair{"a:1", "a"}, {"a:2", "a"}, {"b:1", "b"}}) {
+    std::vector<RegionInfo> regions;
+    for (int i = 0; i < 2; ++i) {
+      regions.push_back(RegionInfo{
+          .server = server,
+          .tier = Tier::kDram,
+          .length = 2 * kBlockSize,
+          .shm = ShmAccess{.host = host, .path = "/dev/shm/x"}});
+    }
+    for (const auto& region :
+         blockingWait(metadata.co_registerServer(std::move(regions), 0))) {
+      serverOf[region.id] = region.server;
+    }
+  }
+  auto allocate = [&](uint32_t count, std::string host) {
+    std::map<std::string, int> on;
+    for (const auto& block : blockingWait(metadata.co_allocate(
+             Tier::kDram, count, std::nullopt, Stick{.host = host}))) {
+      ++on[serverOf.at(block.region)];
+    }
+    return on;
+  };
+
+  // On "b" while it has room for all the blocks, on one server.
+  EXPECT_EQ(allocate(3, "b"), (std::map<std::string, int>{{"b:1", 3}}));
+  // "b" has one block left: a server on "a" has room for both.
+  auto on = allocate(2, "b");
+  EXPECT_EQ(on.size(), 1);
+  EXPECT_TRUE(on.contains("a:1") || on.contains("a:2"));
+  // A host without servers: round robin, still one server per allocation.
+  EXPECT_EQ(allocate(2, "c").size(), 1);
+  // The last free blocks, wherever they are: the write succeeds.
+  EXPECT_EQ(allocate(5, "b").size(), 3);
+}
+
 TEST(MetadataTest, budgetLimitsAllocation) {
   Metadata metadata(exact());
   // 8 blocks of regions, 3 of them usable.

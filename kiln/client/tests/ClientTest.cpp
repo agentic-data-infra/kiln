@@ -128,6 +128,35 @@ TEST_P(ClientTest, blocksSpreadOverServers) {
   blockingWait(client_->co_remove(id));
 }
 
+// A sticky chunk's blocks stay on one server, also over the allocations of
+// later appends; the next sticky chunk goes to the other server. So with a
+// preferred host when every server is on it, or none.
+TEST_P(ClientTest, stickyChunksStayOnOneServer) {
+  // This host has every server; another host has none.
+  for (auto placement :
+       {Placement{.sticky = true},
+        Placement{.preferredHost = localHostName()},
+        Placement{.preferredHost = "no-such-host"}}) {
+    SCOPED_TRACE(placement.preferredHost.value_or("sticky"));
+    std::vector<std::string> servers;
+    for (int i = 0; i < 2; ++i) {
+      const auto data = bytes(8 << 20, i);
+      const auto id = put(data, placement, 1 << 20);
+      EXPECT_EQ(get(id), data);
+      const auto info = blockingWait(client_->co_stat(id));
+      std::set<std::string> on;
+      for (const auto& block : info.replicas[0].blocks) {
+        on.insert(blockingWait(cluster_->metadata().co_getRegions({block.region}))[0].server);
+      }
+      ASSERT_EQ(on.size(), 1);
+      servers.push_back(*on.begin());
+      blockingWait(client_->co_remove(id));
+    }
+    // One chunk after the other: round robin over the servers.
+    EXPECT_NE(servers[0], servers[1]);
+  }
+}
+
 TEST_P(ClientTest, rangeReads) {
   const auto data = bytes(5 * kBlockSize + 123);
   const auto id = put(data, {}, 1 << 20);

@@ -479,8 +479,21 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
     } else if (placement_.retention == Retention::kRetained && !tail_) {
       overflow = placement_.overflow;
     }
+    // A sticky chunk's later blocks go to its first block's server first.
+    std::optional<Stick> stick;
+    if (placement_.sticky || placement_.preferredHost) {
+      stick.emplace();
+      if (blocks.empty()) {
+        stick->host = placement_.preferredHost;
+      } else {
+        stick->region = blocks.front().region;
+      }
+    }
     auto allocated = co_await client_.metadata_->co_allocate(
-        tail_.value_or(replica.tier), static_cast<uint32_t>(count), overflow);
+        tail_.value_or(replica.tier),
+        static_cast<uint32_t>(count),
+        overflow,
+        stick);
     if (overflow) {
       // A named argument: GCC 12 destroys temporaries in a co_await's
       // arguments twice.
@@ -535,7 +548,10 @@ folly::coro::Task<void> ChunkWriter::co_appendTo(
 folly::coro::Task<ChunkId> ChunkWriter::co_commit() {
   checkOpen();
   closed_ = true;
+  // Only where blocks went; not kept with the chunk.
   placement_.overflow.reset();
+  placement_.sticky = false;
+  placement_.preferredHost.reset();
   // Blocks the size hint allocated beyond the chunk's bytes.
   std::vector<BlockRef> unused;
   for (auto& replica : replicas_) {
